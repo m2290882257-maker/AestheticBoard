@@ -1,0 +1,47 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Aesthetic Board Vertical Slice</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="board-shell" aria-label="Inspiration Board">
+      <section class="title-area" aria-label="Board title">
+        <button id="board-title" class="board-title" type="button" title="Edit title"></button>
+        <input id="title-editor" class="title-editor" aria-label="Edit board title" maxlength="72" />
+        <div id="date-label" class="date-label"></div>
+      </section>
+
+      <nav class="action-bar" aria-label="Board actions">
+        <button class="icon-button" type="button" data-popover="more" aria-label="More" title="More"><img src="refer/icon/更多 (1).svg" alt="" /></button>
+        <button class="icon-button" type="button" data-popover="journal" aria-label="Journal" title="Journal"><img src="refer/icon/journal-arrow-up.svg" alt="" /></button>
+        <button class="icon-button" type="button" data-popover="theme" aria-label="Background surface" title="Background surface"><img src="refer/icon/夜晚 (1).svg" alt="" /></button>
+        <button class="icon-button" type="button" data-popover="export" aria-label="Download and share" title="Download and share"><img src="refer/icon/下载.svg" alt="" /></button>
+        <button class="icon-button" type="button" data-popover="trash" aria-label="Trash" title="Trash"><img src="refer/icon/trash.svg" alt="" /></button>
+      </nav>
+
+      <section class="temporal-controls" aria-label="Temporal controls">
+        <div class="day-nav" role="group" aria-label="Day navigation">
+          <button class="text-button" id="prev-day" type="button">Previous</button>
+          <button class="text-button today" id="today" type="button">Today</button>
+          <button class="text-button" id="next-day" type="button">Next</button>
+        </div>
+        <button id="mode-selector" class="mode-selector" type="button" aria-haspopup="true" aria-expanded="false"><span>Day Mode</span><span aria-hidden="true">⌄</span></button>
+      </section>
+
+      <div id="popover-layer" class="popover-layer" aria-live="polite"></div>
+      <section id="canvas" class="canvas-surface" aria-label="Day canvas" tabindex="0"></section>
+      <section class="view-controls" aria-label="Canvas view controls">
+        <button id="reset-view" class="view-reset" type="button">Reset View</button>
+        <span class="view-divider" aria-hidden="true"></span>
+        <span id="zoom-percent" class="zoom-percent">100%</span>
+      </section>
+      <div id="save-state" class="save-state" aria-live="polite">Saved</div>
+    </main>
+    <script src="app.js"></script>
+  </body>
+</html>
+
+
