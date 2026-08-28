@@ -8,6 +8,8 @@ const CAPTURE_MICRO_OFFSET = 24;
 const TRASH_FEEDBACK_MS = 1200;
 const DENSE_ITEM_THRESHOLD = 24;
 const ZOOMED_OUT_THRESHOLD = 0.62;
+const DRAG_HARNESS_LIMIT = 30;
+const TEXT_PREVIEW_LIMIT = 140;
 const copyIcon = "refer/icon/copy (1).svg";
 
 const surfaces = {
@@ -46,6 +48,7 @@ const zoomPercent = document.querySelector("#zoom-percent");
 const trashButton = document.querySelector('[data-popover="trash"]');
 const shellBridge = window.aestheticBoardShell || null;
 let shellState = { alwaysOnTop: false };
+let profileState = { ready: false, profileLabel: "Browser preview", directories: [] };
 
 const state = loadState();
 let dragIntent = null;
@@ -70,7 +73,7 @@ function createDay(seedItems = []) {
 
 function loadState() {
   const todayId = dateKeyFromDate(new Date());
-  const fallback = { activeDayId: todayId, surface: "quiet", days: { [todayId]: createDay(initialItems) }, selectedId: "img-01", activeKeywordId: null, expandedNoteId: null };
+  const fallback = { activeDayId: todayId, surface: "quiet", days: { [todayId]: createDay(initialItems) }, selectedId: "img-01", activeKeywordId: null, expandedNoteId: null, dragHarness: [] };
   try {
     const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
     if (saved.days) return normalizeState({ ...fallback, ...saved });
@@ -83,7 +86,8 @@ function loadState() {
         days: { [legacyDayId]: { title: legacy.customTitle || "", camera: { ...DEFAULT_CAMERA, ...(legacy.camera || {}) }, pasteSequence: legacy.pasteSequence || 0, items: legacy.items } },
         selectedId: legacy.selectedId || null,
         activeKeywordId: legacy.activeKeywordId || null,
-        expandedNoteId: legacy.expandedNoteId || null
+        expandedNoteId: legacy.expandedNoteId || null,
+        dragHarness: []
       });
     }
     return fallback;
@@ -106,6 +110,7 @@ function normalizeState(value) {
   value.selectedId ??= null;
   value.activeKeywordId ??= null;
   value.expandedNoteId ??= null;
+  value.dragHarness = Array.isArray(value.dragHarness) ? value.dragHarness.slice(0, DRAG_HARNESS_LIMIT) : [];
   return value;
 }
 
@@ -130,6 +135,137 @@ function formatMainDate(date) { return new Intl.DateTimeFormat("en", { month: "l
 function formatSecondaryDate(date) { return new Intl.DateTimeFormat("en", { year: "numeric", month: "long", day: "numeric" }).format(date); }
 function screenToWorld(clientX, clientY) { const cam = camera(); return { x: (clientX - cam.x) / cam.zoom, y: (clientY - cam.y) / cam.zoom }; }
 
+
+function cleanPreview(value, limit = TEXT_PREVIEW_LIMIT) {
+  return String(value || "").replace(/\s+/g, " ").trim().slice(0, limit);
+}
+
+function extractFirstHttpUrl(value) {
+  return String(value || "").match(/https?:\/\/[^\s"\'<>]+/i)?.[0] || "";
+}
+
+function summarizeUrl(value) {
+  const preview = cleanPreview(value, 220);
+  if (!preview) return "";
+  try {
+    const url = new URL(preview);
+    return url.origin + url.pathname;
+  } catch {
+    return preview;
+  }
+}
+
+function dataTransferTypes(dataTransfer) {
+  return Array.from(dataTransfer?.types || []);
+}
+
+function fileSummaries(dataTransfer) {
+  return Array.from(dataTransfer?.files || []).map((file) => ({
+    name: file.name || "untitled",
+    type: file.type || "unknown",
+    size: file.size || 0,
+    image: Boolean(file.type && file.type.startsWith("image/"))
+  }));
+}
+
+function dataTransferTypeSamples(dataTransfer) {
+  return dataTransferTypes(dataTransfer).map((type) => {
+    try {
+      const value = dataTransfer?.getData(type) || "";
+      return { type, preview: cleanPreview(value, 180), url: summarizeUrl(extractFirstHttpUrl(value)) };
+    } catch {
+      return { type, preview: "", url: "" };
+    }
+  }).filter((sample) => sample.preview || sample.url);
+}
+
+function hasDropPayload(dataTransfer) {
+  const types = dataTransferTypes(dataTransfer).map((type) => type.toLowerCase());
+  return fileSummaries(dataTransfer).length > 0 || types.some((type) => ["files", "text/uri-list", "text/plain", "text/html", "text/x-moz-url", "url"].includes(type));
+}
+
+function preferredDropEffect(dataTransfer) {
+  const effectAllowed = String(dataTransfer?.effectAllowed || "").toLowerCase();
+  const types = dataTransferTypes(dataTransfer).map((type) => type.toLowerCase());
+  const looksLikeLink = types.some((type) => ["text/uri-list", "text/x-moz-url", "url"].includes(type));
+  if (looksLikeLink && (effectAllowed === "all" || effectAllowed === "uninitialized" || effectAllowed.includes("link"))) return "link";
+  if (effectAllowed === "all" || effectAllowed === "uninitialized" || effectAllowed.includes("copy") || !effectAllowed) return "copy";
+  if (effectAllowed.includes("link")) return "link";
+  if (effectAllowed.includes("move")) return "move";
+  return "copy";
+}
+
+function acceptWindowDrop(event) {
+  if (!event.dataTransfer) return false;
+  event.preventDefault();
+  try { event.dataTransfer.dropEffect = preferredDropEffect(event.dataTransfer); }
+  catch { event.dataTransfer.dropEffect = "copy"; }
+  boardShell.classList.add("drag-over");
+  return true;
+}
+
+function dragCandidateFrom(dataTransfer) {
+  const files = fileSummaries(dataTransfer);
+  const html = dataTransfer?.getData("text/html") || "";
+  const htmlImageUrl = firstUrlFromHtml(html);
+  const htmlLinkUrl = firstLinkFromHtml(html);
+  const uriList = dataTransfer?.getData("text/uri-list") || "";
+  const uriUrl = uriList.split(/\r?\n/).find((line) => line && !line.startsWith("#")) || "";
+  const mozUrl = extractFirstHttpUrl(dataTransfer?.getData("text/x-moz-url"));
+  const legacyUrl = extractFirstHttpUrl(dataTransfer?.getData("URL"));
+  const plain = dataTransfer?.getData("text/plain") || "";
+  const plainUrl = extractFirstHttpUrl(plain.trim());
+  const customSamples = dataTransferTypeSamples(dataTransfer).filter((sample) => !["text/html", "text/uri-list", "text/plain", "text/x-moz-url", "url"].includes(sample.type.toLowerCase()));
+  const customUrl = customSamples.find((sample) => sample.url)?.url || "";
+  let priority = "none";
+  if (files.some((file) => file.image)) priority = "file-image";
+  else if (htmlImageUrl) priority = "html-image";
+  else if (uriUrl) priority = "uri-list";
+  else if (mozUrl) priority = "x-moz-url";
+  else if (legacyUrl) priority = "URL";
+  else if (plainUrl) priority = "plain-url";
+  else if (htmlLinkUrl) priority = "html-link";
+  else if (customUrl) priority = "custom-url";
+  return {
+    priority,
+    htmlImageUrl: summarizeUrl(htmlImageUrl),
+    htmlLinkUrl: summarizeUrl(htmlLinkUrl),
+    uriUrl: summarizeUrl(uriUrl),
+    mozUrl: summarizeUrl(mozUrl),
+    legacyUrl: summarizeUrl(legacyUrl),
+    plainUrl: summarizeUrl(plainUrl),
+    customUrl,
+    customSamples,
+    plainPreview: cleanPreview(plain)
+  };
+}
+
+function makeDragProbe(stage, event, extra = {}) {
+  const world = screenToWorld(event.clientX, event.clientY);
+  return {
+    id: `drag-${Date.now()}-${Math.random().toString(16).slice(2, 7)}`,
+    stage,
+    activeDayId: state.activeDayId,
+    itemCount: items().length,
+    pointer: { screenX: Math.round(event.clientX), screenY: Math.round(event.clientY), worldX: Math.round(world.x), worldY: Math.round(world.y) },
+    types: dataTransferTypes(event.dataTransfer),
+    files: fileSummaries(event.dataTransfer),
+    candidate: dragCandidateFrom(event.dataTransfer),
+    ...extra
+  };
+}
+
+function recordDragHarness(stage, event, extra = {}) {
+  const probe = makeDragProbe(stage, event, extra);
+  state.dragHarness.unshift(probe);
+  state.dragHarness = state.dragHarness.slice(0, DRAG_HARNESS_LIMIT);
+  persist();
+  if (shellBridge?.recordDragProbe) {
+    shellBridge.recordDragProbe(probe).catch(() => {});
+  }
+  return probe;
+}
+
 function pointInsideElement(element, clientX, clientY) {
   if (!element) return false;
   const rect = element.getBoundingClientRect();
@@ -153,6 +289,16 @@ function previewLabel(value) {
   catch { return value || "Untitled"; }
 }
 
+function linkTitleFromUrl(value) {
+  try {
+    const url = new URL(value);
+    const lastPath = decodeURIComponent(url.pathname.split("/").filter(Boolean).pop() || "");
+    return lastPath ? lastPath.replace(/[-_]+/g, " ").slice(0, 46) : url.hostname;
+  } catch {
+    return cleanPreview(value, 46) || "Link";
+  }
+}
+
 function isLikelyImageUrl(value) {
   return /\.(png|jpe?g|gif|webp|svg|avif)(?:[?#]|$)/i.test(value || "");
 }
@@ -168,7 +314,8 @@ function moveImageToTrash(id) {
   const index = currentItems.findIndex((item) => item.id === id);
   if (index < 0) return false;
   const [removed] = currentItems.splice(index, 1);
-  addTrashRecord({ kind: "image", item: { ...removed, keywords: [...(removed.keywords || [])] }, label: removed.keywords?.[0] || "Image object" });
+  const trashKind = removed.kind === "link" ? "link" : "image";
+  addTrashRecord({ kind: trashKind, item: { ...removed, keywords: [...(removed.keywords || [])] }, url: removed.url || "", label: removed.label || removed.keywords?.[0] || (trashKind === "link" ? "Link object" : "Image object") });
   if (state.selectedId === id) state.selectedId = null;
   if (state.activeKeywordId === id) state.activeKeywordId = null;
   if (state.expandedNoteId === id) state.expandedNoteId = null;
@@ -181,7 +328,7 @@ async function restoreTrashItem(trashId) {
   const index = currentTrash.findIndex((entry) => entry.trashId === trashId);
   if (index < 0) return;
   const [entry] = currentTrash.splice(index, 1);
-  if (entry.kind === "image" && entry.item) {
+  if ((entry.kind === "image" || entry.kind === "link") && entry.item) {
     const item = { ...entry.item, keywords: [...(entry.item.keywords || [])] };
     if (items().some((candidate) => candidate.id === item.id)) item.id = `restored-${Date.now()}`;
     item.z = Math.max(...items().map((value) => value.z), 0) + 1;
@@ -222,6 +369,7 @@ async function storeDropInTrash(event) {
   boardShell.classList.remove("drag-over");
   clearTrashTarget();
   closePopovers();
+  recordDragHarness("trash-drop", event, { target: "trash" });
   try {
     const file = [...event.dataTransfer.files].find((candidate) => candidate.type.startsWith("image/"));
     if (file) {
@@ -237,7 +385,8 @@ async function storeDropInTrash(event) {
       return;
     }
     addTrashRecord({ kind: "link", url, label: previewLabel(url), sourceType: "trash-drop-link" });
-  } catch {
+  } catch (error) {
+    recordDragHarness("trash-drop-failed", event, { target: "trash", error: error?.message || "Trash drop failed" });
     saveState.textContent = "Trash drop failed";
     setTimeout(() => { saveState.textContent = "Saved"; }, TRASH_FEEDBACK_MS);
   }
@@ -248,6 +397,11 @@ async function initializeShellBridge() {
   if (!shellBridge) return;
   try { shellState = await shellBridge.getShellState(); }
   catch { shellState = { alwaysOnTop: false }; }
+  try {
+    if (shellBridge.getProfileState) profileState = await shellBridge.getProfileState();
+  } catch {
+    profileState = { ready: false, profileLabel: "Profile unavailable", directories: [] };
+  }
 }
 
 async function toggleAlwaysOnTop() {
@@ -263,26 +417,66 @@ async function toggleAlwaysOnTop() {
   }
 }
 
+function makePopoverButton(label, value, handler, disabled = false) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.disabled = disabled;
+  const name = document.createElement("span");
+  name.textContent = label;
+  const detail = document.createElement("span");
+  detail.textContent = value;
+  button.append(name, detail);
+  if (handler) button.addEventListener("click", handler);
+  return button;
+}
+
+function openDragHarnessPopover(popover) {
+  popover.classList.add("harness-popover");
+  popover.innerHTML = "";
+  const title = document.createElement("h2");
+  title.textContent = `Drag Harness (${state.dragHarness.length})`;
+  popover.appendChild(title);
+  if (!state.dragHarness.length) {
+    const empty = document.createElement("p");
+    empty.className = "diagnostic-empty";
+    empty.textContent = "No drag samples yet.";
+    popover.appendChild(empty);
+    return;
+  }
+  const list = document.createElement("div");
+  list.className = "diagnostic-list";
+  state.dragHarness.slice(0, 8).forEach((probe) => {
+    const row = document.createElement("article");
+    row.className = "diagnostic-entry";
+    const head = document.createElement("strong");
+    head.textContent = `${probe.stage} / ${probe.candidate?.priority || "none"}`;
+    const meta = document.createElement("span");
+    const typeCount = probe.types?.length || 0;
+    const fileCount = probe.files?.length || 0;
+    meta.textContent = `${typeCount} types, ${fileCount} files, @ ${probe.pointer?.worldX || 0}, ${probe.pointer?.worldY || 0}`;
+    const candidate = document.createElement("span");
+    candidate.textContent = probe.candidate?.htmlImageUrl || probe.candidate?.uriUrl || probe.candidate?.mozUrl || probe.candidate?.legacyUrl || probe.candidate?.plainUrl || probe.candidate?.htmlLinkUrl || probe.candidate?.customUrl || probe.candidate?.customSamples?.[0]?.preview || probe.candidate?.plainPreview || "No preview";
+    row.append(head, meta, candidate);
+    list.appendChild(row);
+  });
+  popover.appendChild(list);
+}
+
 function openMorePopover(popover) {
   popover.innerHTML = "";
   const title = document.createElement("h2");
   title.textContent = "More";
-  const always = document.createElement("button");
-  always.type = "button";
-  always.dataset.action = "always-on-top";
-  always.disabled = !shellBridge;
   const status = shellBridge ? (shellState.alwaysOnTop ? "On" : "Off") : "Electron only";
-  always.innerHTML = "<span>Always-on-top</span><span>" + status + "</span>";
-  always.addEventListener("click", toggleAlwaysOnTop);
-  const keyword = document.createElement("button");
-  keyword.type = "button";
-  keyword.disabled = true;
-  keyword.textContent = "Keyword visibility";
-  const privacy = document.createElement("button");
-  privacy.type = "button";
-  privacy.disabled = true;
-  privacy.textContent = "Data and privacy";
-  popover.append(title, always, keyword, privacy);
+  const always = makePopoverButton("Always-on-top", status, toggleAlwaysOnTop, !shellBridge);
+  always.dataset.action = "always-on-top";
+  const profileDetail = profileState.metadata?.ready ? "SQLite ready" : profileState.ready ? "Files ready" : "Browser only";
+  const profile = makePopoverButton("Local profile", profileDetail, null, true);
+  profile.className = "profile-status-row";
+  profile.title = profileState.profileLabel || "Profile unavailable";
+  const dragHarness = makePopoverButton("Drag Harness", `${state.dragHarness.length} samples`, () => openDragHarnessPopover(popover));
+  const keyword = makePopoverButton("Keyword visibility", "Soon", null, true);
+  const privacy = makePopoverButton("Data and privacy", profileState.profileLabel || "Local only", null, true);
+  popover.append(title, always, profile, dragHarness, keyword, privacy);
 }
 function renderChrome() {
   const currentDay = day();
@@ -310,8 +504,12 @@ function renderCamera() {
 
 function renderCanvas() {
   canvas.innerHTML = "";
-  items().slice().sort((a, b) => a.z - b.z).forEach((item) => canvas.appendChild(createImageObject(item)));
+  items().slice().sort((a, b) => a.z - b.z).forEach((item) => canvas.appendChild(createBoardObject(item)));
   renderCamera();
+}
+
+function createBoardObject(item) {
+  return item.kind === "link" ? createLinkObject(item) : createImageObject(item);
 }
 
 function createImageObject(item) {
@@ -325,6 +523,9 @@ function createImageObject(item) {
   object.classList.toggle("selected", state.selectedId === item.id);
   object.classList.toggle("locked", item.locked);
   object.classList.toggle("keywords-open", state.activeKeywordId === item.id);
+  object.classList.toggle("capture-localizing", item.lifecycleState === "LOCALIZING");
+  object.classList.toggle("capture-failed", item.lifecycleState === "FAILED");
+  object.classList.toggle("capture-durable", item.lifecycleState === "DURABLE" || item.lifecycleState === "ORIGINAL_LOCAL");
   object.tabIndex = 0;
   object.setAttribute("role", "group");
   object.setAttribute("aria-label", `${item.keywords?.[0] || "Captured image"}${item.locked ? ", locked" : ""}`);
@@ -347,7 +548,10 @@ function createImageObject(item) {
   const lockMark = document.createElement("span");
   lockMark.className = "lock-mark";
   lockMark.textContent = "Locked";
-  frame.append(createKeywordLayer(item), img, lockMark);
+  const captureMark = document.createElement("span");
+  captureMark.className = "capture-state-mark";
+  captureMark.textContent = captureStateLabel(item);
+  frame.append(createKeywordLayer(item), img, lockMark, captureMark);
 
   ["nw", "ne", "sw", "se"].forEach((corner) => {
     const handle = document.createElement("span");
@@ -362,10 +566,64 @@ function createImageObject(item) {
   return object;
 }
 
+function createLinkObject(item) {
+  const object = document.createElement("article");
+  object.className = "image-object link-object";
+  object.dataset.id = item.id;
+  object.style.left = item.x + "px";
+  object.style.top = item.y + "px";
+  object.style.zIndex = String(item.z);
+  object.style.setProperty("--object-width", item.width + "px");
+  object.classList.toggle("selected", state.selectedId === item.id);
+  object.classList.toggle("locked", item.locked);
+  object.classList.toggle("keywords-open", state.activeKeywordId === item.id);
+  object.tabIndex = 0;
+  object.setAttribute("role", "group");
+  object.setAttribute("aria-label", (item.label || "Captured link") + (item.locked ? ", locked" : ""));
+  object.addEventListener("focus", () => {
+    state.selectedId = item.id;
+    canvas.querySelectorAll(".image-object").forEach((node) => node.classList.toggle("selected", node.dataset.id === item.id));
+  });
+
+  const frame = document.createElement("div");
+  frame.className = "image-frame link-card";
+  frame.addEventListener("pointerdown", (event) => beginMove(event, item));
+  frame.addEventListener("contextmenu", (event) => openContextMenu(event, item));
+
+  const mark = document.createElement("span");
+  mark.className = "link-mark";
+  mark.textContent = "Link";
+  const title = document.createElement("strong");
+  title.textContent = item.label || linkTitleFromUrl(item.url);
+  const host = document.createElement("span");
+  host.textContent = previewLabel(item.url);
+  const open = document.createElement("button");
+  open.type = "button";
+  open.textContent = "Open";
+  open.addEventListener("pointerdown", (event) => event.stopPropagation());
+  open.addEventListener("click", (event) => { event.stopPropagation(); window.open(item.url, "_blank", "noopener"); });
+  const lockMark = document.createElement("span");
+  lockMark.className = "lock-mark";
+  lockMark.textContent = "Locked";
+  frame.append(createKeywordLayer(item), mark, title, host, open, lockMark);
+
+  ["nw", "ne", "sw", "se"].forEach((corner) => {
+    const handle = document.createElement("span");
+    handle.className = "resize-handle " + corner;
+    handle.dataset.corner = corner;
+    handle.addEventListener("pointerdown", (event) => beginResize(event, item));
+    frame.appendChild(handle);
+  });
+
+  object.append(frame);
+  if (item.note || state.selectedId === item.id || state.expandedNoteId === item.id) object.appendChild(createQuickNote(item));
+  return object;
+}
+
 function createKeywordLayer(item) {
   const layer = document.createElement("div");
   layer.className = "keyword-layer";
-  const keywords = item.keywords?.length ? item.keywords : ["image first"];
+  const keywords = item.keywords?.length ? item.keywords : [item.kind === "link" ? "link capture" : "image first"];
   const folded = document.createElement("button");
   folded.className = "keyword-folded";
   folded.type = "button";
@@ -444,6 +702,13 @@ function showLocalFeedback(container, message) {
   setTimeout(() => feedback.remove(), 1100);
 }
 function pinKeyword(item, keyword) { item.keywords = [keyword, ...item.keywords.filter((value) => value !== keyword)]; state.activeKeywordId = item.id; renderCanvas(); persist(); }
+
+function captureStateLabel(item) {
+  if (item.lifecycleState === "LOCALIZING") return "Saving";
+  if (item.lifecycleState === "FAILED") return "Needs retry";
+  if (item.lifecycleState === "ORIGINAL_LOCAL") return "Local";
+  return "";
+}
 
 function beginPan(event) {
   if (event.button !== 1) return;
@@ -612,14 +877,56 @@ function comfortableInitialWidth(naturalWidth, naturalHeight) {
 function imageSizeFromSource(src) { return new Promise((resolve) => { const image = new Image(); image.onload = () => resolve({ width: image.naturalWidth || 280, height: image.naturalHeight || 210 }); image.onerror = () => resolve({ width: 280, height: 210 }); image.src = src; }); }
 function readFileAsDataUrl(file) { return new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result)); reader.onerror = reject; reader.readAsDataURL(file); }); }
 
-function createCapturedImage(src, naturalSize, sourceType, worldPoint = null) {
+function createCapturedImage(src, naturalSize, sourceType, worldPoint = null, options = {}) {
   const currentDay = day();
   const width = comfortableInitialWidth(naturalSize.width, naturalSize.height);
   const height = width * (naturalSize.height / naturalSize.width);
   const center = worldPoint || screenToWorld(window.innerWidth / 2, window.innerHeight / 2);
   const offset = (currentDay.pasteSequence % 6) * CAPTURE_MICRO_OFFSET;
-  const id = `${sourceType}-${Date.now()}-${currentDay.pasteSequence}`;
-  const item = { id, src, sourceType, capturedAt: new Date().toISOString(), x: Math.round(center.x - width / 2 + offset), y: Math.round(center.y - height / 2 + offset), width, z: Math.max(...items().map((value) => value.z), 0) + 1, locked: false, keywords: sourceType === "browser-drag" ? ["browser drag", "image first", "drop position", "visual capture", "quiet archive"] : ["clipboard paste", "image first", "unsorted reference", "visual capture", "quiet archive"], note: "" };
+  const id = options.id || `${sourceType}-${Date.now()}-${currentDay.pasteSequence}`;
+  const item = {
+    id,
+    kind: "image",
+    src,
+    sourceType,
+    capturedAt: new Date().toISOString(),
+    x: Math.round(center.x - width / 2 + offset),
+    y: Math.round(center.y - height / 2 + offset),
+    width,
+    z: Math.max(...items().map((value) => value.z), 0) + 1,
+    locked: false,
+    keywords: sourceType === "browser-drag" ? ["browser drag", "image first", "drop position", "visual capture", "quiet archive"] : ["clipboard paste", "image first", "unsorted reference", "visual capture", "quiet archive"],
+    note: "",
+    lifecycleState: options.lifecycleState || "READY",
+    captureError: ""
+  };
+  currentDay.items.push(item);
+  currentDay.pasteSequence += 1;
+  state.selectedId = id; state.activeKeywordId = null; state.expandedNoteId = null;
+  renderCanvas(); persist();
+  return item;
+}
+
+function createCapturedLink(url, worldPoint = null) {
+  const currentDay = day();
+  const center = worldPoint || screenToWorld(window.innerWidth / 2, window.innerHeight / 2);
+  const offset = (currentDay.pasteSequence % 6) * CAPTURE_MICRO_OFFSET;
+  const id = "link-drag-" + Date.now() + "-" + currentDay.pasteSequence;
+  const item = {
+    id,
+    kind: "link",
+    url,
+    label: linkTitleFromUrl(url),
+    sourceType: "browser-drag-link",
+    capturedAt: new Date().toISOString(),
+    x: Math.round(center.x - 130 + offset),
+    y: Math.round(center.y - 58 + offset),
+    width: 260,
+    z: Math.max(...items().map((value) => value.z), 0) + 1,
+    locked: false,
+    keywords: ["link capture", previewLabel(url), "browser drag", "reference trail", "quiet archive"],
+    note: ""
+  };
   currentDay.items.push(item);
   currentDay.pasteSequence += 1;
   state.selectedId = id; state.activeKeywordId = null; state.expandedNoteId = null;
@@ -627,23 +934,85 @@ function createCapturedImage(src, naturalSize, sourceType, worldPoint = null) {
 }
 
 function firstUrlFromHtml(html) {
-  const doc = new DOMParser().parseFromString(html, "text/html");
+  const doc = new DOMParser().parseFromString(html || "", "text/html");
   const img = doc.querySelector("img[src]");
   return img?.src || "";
+}
+function firstLinkFromHtml(html) {
+  const doc = new DOMParser().parseFromString(html || "", "text/html");
+  const anchor = doc.querySelector("a[href]");
+  return anchor?.href || "";
 }
 function firstUrlFromDrop(dataTransfer) {
   const uri = dataTransfer.getData("text/uri-list").split(/\r?\n/).find((line) => line && !line.startsWith("#"));
   if (uri) return uri;
-  const plain = dataTransfer.getData("text/plain").trim();
-  if (/^https?:\/\//i.test(plain)) return plain;
-  return firstUrlFromHtml(dataTransfer.getData("text/html"));
+  const mozUrl = extractFirstHttpUrl(dataTransfer.getData("text/x-moz-url"));
+  if (mozUrl) return mozUrl;
+  const legacyUrl = extractFirstHttpUrl(dataTransfer.getData("URL"));
+  if (legacyUrl) return legacyUrl;
+  const plainUrl = extractFirstHttpUrl(dataTransfer.getData("text/plain"));
+  if (plainUrl) return plainUrl;
+  const html = dataTransfer.getData("text/html");
+  const htmlUrl = firstUrlFromHtml(html) || firstLinkFromHtml(html);
+  if (htmlUrl) return htmlUrl;
+  return dataTransferTypeSamples(dataTransfer).find((sample) => sample.url)?.url || "";
+}
+
+async function commitLocalCapture(item, dataUrl, naturalSize, sourceType, candidateManifest = {}) {
+  if (!shellBridge?.commitCapturedMedia) return;
+  item.lifecycleState = "LOCALIZING";
+  renderCanvas();
+  try {
+    const height = item.width * ((naturalSize.height || 1) / (naturalSize.width || 1));
+    const response = await shellBridge.commitCapturedMedia({
+      captureId: item.id,
+      dayCanvasId: state.activeDayId,
+      boardDate: state.activeDayId,
+      sourceType,
+      dataUrl,
+      pixelWidth: naturalSize.width || 0,
+      pixelHeight: naturalSize.height || 0,
+      imageObject: {
+        id: item.id,
+        sourceType,
+        capturedAt: item.capturedAt,
+        x: item.x,
+        y: item.y,
+        width: item.width,
+        height,
+        z: item.z,
+        locked: item.locked,
+        note: item.note,
+        keywords: item.keywords,
+        lifecycleState: "DURABLE",
+        revision: 1
+      },
+      candidateManifest
+    });
+    if (!response?.ok) throw new Error(response?.error || "CAPTURE_COMMIT_FAILED");
+    item.assetId = response.assetId;
+    item.sha256 = response.sha256;
+    item.originalRelpath = response.originalRelpath;
+    item.byteLength = response.byteLength;
+    item.src = response.rendererSrc || item.src;
+    item.lifecycleState = response.persistence?.ok ? "DURABLE" : "ORIGINAL_LOCAL";
+    item.captureError = response.persistence?.ok ? "" : (response.persistence?.error || "SQLite unavailable");
+    saveState.textContent = response.persistence?.ok ? "Saved" : "Saved local";
+  } catch (error) {
+    item.lifecycleState = "FAILED";
+    item.captureError = error?.message || "Capture commit failed";
+    saveState.textContent = "Capture saved on board only";
+  }
+  renderCanvas();
+  persist();
 }
 
 async function captureFile(file, sourceType, worldPoint) {
   saveState.textContent = sourceType === "browser-drag" ? "Dropping" : "Pasting";
   const src = await readFileAsDataUrl(file);
   const naturalSize = await imageSizeFromSource(src);
-  createCapturedImage(src, naturalSize, sourceType, worldPoint);
+  const item = createCapturedImage(src, naturalSize, sourceType, worldPoint, { lifecycleState: shellBridge?.commitCapturedMedia ? "LOCALIZING" : "READY" });
+  await commitLocalCapture(item, src, naturalSize, sourceType, { fileName: file.name || "untitled", fileType: file.type || "", byteLength: file.size || 0 });
 }
 async function captureRemoteUrl(url, worldPoint) {
   saveState.textContent = "Dropping";
@@ -660,21 +1029,24 @@ async function handlePaste(event) {
   catch { saveState.textContent = "Paste failed"; setTimeout(() => { saveState.textContent = "Saved"; }, 1400); }
 }
 function handleDragOver(event) {
-  if (event.target.closest(".title-area,.action-bar,.temporal-controls,.popover,.view-controls")) return;
-  event.preventDefault(); event.dataTransfer.dropEffect = "copy"; boardShell.classList.add("drag-over");
+  acceptWindowDrop(event);
 }
 function handleDragLeave(event) { if (!boardShell.contains(event.relatedTarget)) boardShell.classList.remove("drag-over"); }
 async function handleDrop(event) {
-  if (event.target.closest(".title-area,.action-bar,.temporal-controls,.popover,.view-controls")) return;
+  if (event.target.closest(".popover")) return;
   event.preventDefault(); event.stopPropagation(); boardShell.classList.remove("drag-over"); closePopovers();
+  const probe = recordDragHarness("drop", event, { target: "canvas" });
   const worldPoint = screenToWorld(event.clientX, event.clientY);
   const file = [...event.dataTransfer.files].find((candidate) => candidate.type.startsWith("image/"));
   try {
     if (file) return await captureFile(file, "browser-drag", worldPoint);
     const url = firstUrlFromDrop(event.dataTransfer);
-    if (!url) throw new Error("No image candidate");
-    await captureRemoteUrl(url, worldPoint);
-  } catch {
+    if (!url) throw new Error("No drop candidate");
+    const candidate = probe.candidate || dragCandidateFrom(event.dataTransfer);
+    if (candidate.priority === "html-image" || isLikelyImageUrl(url)) return await captureRemoteUrl(url, worldPoint);
+    createCapturedLink(url, worldPoint);
+  } catch (error) {
+    recordDragHarness("drop-failed", event, { target: "canvas", error: error?.message || "Drop failed" });
     saveState.textContent = "Drop failed";
     setTimeout(() => { saveState.textContent = "Saved"; }, 1400);
   }
@@ -692,10 +1064,11 @@ function openContextMenu(event, item) {
   menu.className = "popover";
   menu.style.left = `${Math.min(event.clientX, window.innerWidth - 250)}px`;
   menu.style.top = `${Math.min(event.clientY, window.innerHeight - 190)}px`;
-  menu.innerHTML = `<h2>Image</h2><button type="button" data-action="lock">${item.locked ? "Unlock" : "Lock"}</button><button type="button" data-action="note">Edit Note</button><button type="button" data-action="front">Bring to Front</button><button type="button" data-action="trash">Move to Trash</button>`;
+  menu.innerHTML = `<h2>${item.kind === "link" ? "Link" : "Image"}</h2><button type="button" data-action="lock">${item.locked ? "Unlock" : "Lock"}</button><button type="button" data-action="note">Edit Note</button><button type="button" data-action="front">Bring to Front</button>${item.kind === "link" ? `<button type="button" data-action="open">Open Link</button>` : ""}<button type="button" data-action="trash">Move to Trash</button>`;
   menu.querySelector('[data-action="lock"]').addEventListener("click", () => { item.locked = !item.locked; closePopovers(); renderCanvas(); persist(); });
   menu.querySelector('[data-action="note"]').addEventListener("click", () => { closePopovers(); state.expandedNoteId = item.id; renderCanvas(); editNote(canvas.querySelector(`[data-id="${item.id}"] .quick-note`), item); });
   menu.querySelector('[data-action="front"]').addEventListener("click", () => { item.z = Math.max(...items().map((value) => value.z), 0) + 1; closePopovers(); renderCanvas(); persist(); });
+  menu.querySelector('[data-action="open"]')?.addEventListener("click", () => { window.open(item.url, "_blank", "noopener"); closePopovers(); });
   menu.querySelector('[data-action="trash"]').addEventListener("click", () => { closePopovers(); moveImageToTrash(item.id); });
   popoverLayer.appendChild(menu);
 }
@@ -761,11 +1134,11 @@ function openTrashPopover(popover) {
       restore.addEventListener("click", () => restoreTrashItem(entry.trashId));
       actions.appendChild(restore);
     }
-    if (entry.kind === "link" && entry.url) {
+    if (entry.kind === "link" && (entry.url || entry.item?.url)) {
       const open = document.createElement("button");
       open.type = "button";
       open.textContent = "Open";
-      open.addEventListener("click", () => window.open(entry.url, "_blank", "noopener"));
+      open.addEventListener("click", () => window.open(entry.url || entry.item?.url, "_blank", "noopener"));
       actions.appendChild(open);
     }
     const remove = document.createElement("button");
@@ -816,6 +1189,8 @@ document.querySelector("#today").addEventListener("click", () => { state.activeD
 resetView.addEventListener("click", resetCamera);
 boardShell.addEventListener("wheel", handleWheelZoom, { passive: false });
 boardShell.addEventListener("pointerdown", beginPan);
+window.addEventListener("dragenter", handleDragOver, true);
+window.addEventListener("dragover", handleDragOver, true);
 boardShell.addEventListener("dragover", handleDragOver);
 boardShell.addEventListener("dragleave", handleDragLeave);
 boardShell.addEventListener("drop", handleDrop);
