@@ -35,6 +35,8 @@ Implemented slices:
 | 21 | Done | Failed captures have object-local Retry, Keep Reference, and Remove actions; More includes profile details and media index repair. |
 | 22 | Done | Search index covers days, titles, keywords, notes, links, hosts, dates, and source types; results highlight objects without reflow and jump by camera. |
 | 23 | Done | Download / Share can export current-day JSON locally and desktop viewport PNG without mutating board state; desktop exports use a Save As dialog. |
+| 24 | Done | Failed mutation ACKs are kept in an ordered retry queue with object-level Retry save / Keep actions and a compact conflict indicator. |
+| 25 | Done | Restore harness can export sanitized Profile fixtures and run a read-only Profile verification summary. |
 
 ## Verified Behaviors
 
@@ -48,6 +50,8 @@ Implemented slices:
 - Window bounds and always-on-top state are persisted by Electron shell state.
 - Search works across saved historical days and highlights current-day matches without moving or reordering objects.
 - Export JSON omits absolute local media paths; desktop JSON and PNG exports open a Save As dialog so the user chooses the destination folder.
+- Failed save ACKs now remain visible without reverting optimistic object state, and can be retried globally or per object.
+- Restore diagnostics can export sanitized fixture JSON and verify days, objects, trash, media assets, and capture jobs without mutating the board.
 
 ## Current Architecture Reality
 
@@ -60,6 +64,8 @@ The current codebase is still intentionally lightweight and prototype-shaped:
 - Local captured images render through `app-media://asset/<assetId>?variant=working` with fallback to original; capture job recovery uses `capture-jobs.json` plus the media index to repair interrupted localizing jobs. Remote image URL capture remains a reference path and is not yet safely fetched/localized.
 - Search is currently a renderer-built read-only index over the loaded snapshot, not a dedicated SQLite FTS table yet.
 - Export is local-only: JSON works in browser preview or desktop; PNG capture is desktop-only through Electron `capturePage`; desktop exports ask for a save path before writing.
+- Mutation retry is renderer-managed over the current optimistic state; a future pass can move retry metadata into a dedicated durable retry table.
+- Restore harness fixtures are small JSON scenarios under `fixtures/restore-harness`; they intentionally reference relative media paths only.
 
 ## Known Technical Debt
 
@@ -73,45 +79,11 @@ The current codebase is still intentionally lightweight and prototype-shaped:
 
 ## Recommended Immediate Order
 
-1. Slice 24: Mutation Retry Queue And Conflict Surface.
-2. Slice 25: Import / Restore Test Harness.
-3. Slice 26: Remote URL Localization Adapter.
-4. Slice 27: SQLite Search Index / FTS Upgrade.
-5. Slice 28: Import First Pass.
-
-### Slice 24: Mutation Retry Queue And Conflict Surface
-
-Goal: let failed mutation ACKs stay visible and recoverable without undoing optimistic renderer state.
-
-Tasks:
-
-1. Add an explicit retry queue for failed mutation IDs.
-2. Surface object-level retry affordances for failed move, resize, lock, note, keyword, and trash mutations.
-3. Keep retry ordering per day and per object.
-4. Add a compact conflict indicator when a snapshot revision is older than the current ACK.
-
-Acceptance:
-
-- Failed ACKs can be retried without recreating objects.
-- Optimistic object state stays visible until a user chooses a repair action.
-- Retry does not duplicate capture jobs or trash entries.
-
-### Slice 25: Import / Restore Test Harness
-
-Goal: prove Profile recovery paths can be exercised repeatedly without manual file surgery.
-
-Tasks:
-
-1. Add a local-only diagnostics action to export a small restore fixture.
-2. Add test fixtures for snapshot interruption, staging residue, durable media, and failed capture jobs.
-3. Add a read-only verification command that reports restored days, objects, trash, media assets, and capture jobs.
-
-Acceptance:
-
-- A developer can reproduce restart recovery scenarios from fixtures.
-- Verification never mutates the user board.
-- Fixture outputs avoid absolute local media paths unless explicitly requested.
-
+1. Slice 26: Remote URL Localization Adapter.
+2. Slice 27: SQLite Search Index / FTS Upgrade.
+3. Slice 28: Import First Pass.
+4. Slice 29: Durable Mutation Retry Metadata.
+5. Slice 30: Export Full-Day Renderer.
 
 ### Slice 26: Remote URL Localization Adapter
 

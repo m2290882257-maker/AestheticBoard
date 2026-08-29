@@ -3,7 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const { pathToFileURL } = require('url');
 const { ensureMetadataStore, insertDurableCapture, saveWorkspaceSnapshot, loadWorkspaceSnapshot } = require('./persistence.cjs');
-const { commitDataUrl, resolveAssetPath, recoverCaptureJobs, repairMediaIndex } = require('./media-store.cjs');
+const { commitDataUrl, resolveAssetPath, recoverCaptureJobs, repairMediaIndex, readCaptureJobs, readMediaIndex } = require('./media-store.cjs');
 const { validatePersistenceEnvelope } = require('./mutation-contract.cjs');
 
 const stateFileName = 'workspace-state.json';
@@ -73,7 +73,10 @@ class PersistenceWorker {
 
   read() {
     const loaded = loadWorkspaceSnapshot(this.rootProvider());
-    if (loaded?.ok) loaded.captureRecovery = recoverCaptureJobs(this.rootProvider());
+    if (loaded?.ok) {
+      loaded.captureRecovery = recoverCaptureJobs(this.rootProvider());
+      this.lastAck = { revision: Number(loaded.snapshot?.persistenceRevision || this.lastAck.revision || 0), updatedAtUtc: loaded.snapshot?.updatedAtUtc || this.lastAck.updatedAtUtc };
+    }
     return loaded;
   }
 }
@@ -257,6 +260,68 @@ async function captureViewportPng(request) {
   fs.writeFileSync(filePath, buffer);
   return { ok: true, filePath, fileName: path.basename(filePath), byteLength: buffer.length };
 }
+function sanitizeFixtureSnapshot(snapshot) {
+  const clean = JSON.parse(JSON.stringify(snapshot || {}, (key, value) => {
+    if (['pendingMutationIds', 'mutationError', 'pendingDataUrl'].includes(key)) return undefined;
+    if (typeof value === 'string' && /^[a-z]:\\|^\\\\/i.test(value)) return '';
+    return value;
+  }));
+  Object.values(clean.days || {}).forEach((day) => {
+    (day.items || []).forEach((item) => { if (item.originalRelpath) item.src = item.assetId ? "app-media://asset/" + item.assetId + "?variant=working" : item.src; });
+    (day.trash || []).forEach((entry) => { if (entry.item?.originalRelpath && entry.item.assetId) entry.item.src = "app-media://asset/" + entry.item.assetId + "?variant=working"; });
+  });
+  return clean;
+}
+function buildRestoreFixture(snapshot) {
+  const mediaIndex = readMediaIndex(profileRoot());
+  const captureJobs = readCaptureJobs(profileRoot());
+  return {
+    schemaVersion: 1,
+    product: 'AestheticBoard',
+    fixtureType: 'restore-harness',
+    exportedAtUtc: new Date().toISOString(),
+    snapshot: sanitizeFixtureSnapshot(snapshot),
+    mediaAssets: Object.values(mediaIndex.assets || {}).map((asset) => ({ assetId: asset.assetId, sha256: asset.sha256, originalRelpath: asset.originalRelpath, variants: asset.variants ? Object.fromEntries(Object.entries(asset.variants).map(([key, record]) => [key, { role: record.role, state: record.state, relpath: record.relpath, mime: record.mime, byteLength: record.byteLength || 0 }])) : {} })),
+    captureJobs: Object.values(captureJobs.jobs || {}).map((job) => ({ id: job.id, state: job.state, dayCanvasId: job.dayCanvasId, sourceType: job.sourceType, assetId: job.assetId || "", sha256: job.sha256 || "", originalRelpath: job.originalRelpath || "", lastErrorCode: job.lastErrorCode || "" })),
+    scenarios: ["snapshot-interruption", "staging-residue", "durable-media", "failed-capture-job"]
+  };
+}
+async function exportRestoreFixture(request) {
+  const state = safeProfileState();
+  if (!state.ready) return { ok: false, error: state.error || 'Profile unavailable' };
+  const filePath = await chooseExportPath('aesthetic-board-restore-fixture-' + Date.now() + '.json', '.json', [{ name: 'Restore Fixture JSON', extensions: ['json'] }]);
+  if (!filePath) return { ok: false, canceled: true, error: 'Export canceled' };
+  const fixture = buildRestoreFixture(request?.snapshot || loadWorkspaceSnapshot(profileRoot())?.snapshot || {});
+  const content = JSON.stringify(fixture, null, 2);
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, content, 'utf8');
+  return { ok: true, filePath, fileName: path.basename(filePath), byteLength: Buffer.byteLength(content, "utf8"), scenarios: fixture.scenarios };
+}
+function verifyRestoreProfile() {
+  const state = safeProfileState();
+  if (!state.ready) return { ok: false, error: state.error || 'Profile unavailable' };
+  const loaded = loadWorkspaceSnapshot(profileRoot());
+  const snapshot = loaded?.snapshot || {};
+  const days = Object.values(snapshot.days || {});
+  const mediaIndex = readMediaIndex(profileRoot());
+  const captureJobs = readCaptureJobs(profileRoot());
+  const jobs = Object.values(captureJobs.jobs || {});
+  const result = {
+    ok: true,
+    source: loaded?.source || "none",
+    revision: Number(snapshot.persistenceRevision || 0),
+    activeDayId: snapshot.activeDayId || "",
+    days: days.length,
+    objects: days.reduce((sum, day) => sum + (day.items || []).length, 0),
+    trash: days.reduce((sum, day) => sum + (day.trash || []).length, 0),
+    mediaAssets: Object.keys(mediaIndex.assets || {}).length,
+    captureJobs: jobs.length,
+    failedCaptureJobs: jobs.filter((job) => job.state === 'FAILED').length,
+    incompleteCaptureJobs: jobs.filter((job) => ['QUEUED', 'RESOLVING', 'LOCALIZING'].includes(job.state)).length,
+    checkedAtUtc: new Date().toISOString()
+  };
+  return result;
+}
 function registerMediaProtocol() {
   if (mediaProtocolRegistered) return;
   mediaProtocolRegistered = true;
@@ -350,11 +415,16 @@ ipcMain.handle('persistence:save-mutations', (_event, request) => {
     return { ok: false, error: 'INVALID_MUTATION_ENVELOPE', details: validation.error, mutationIds: Array.isArray(request?.mutations) ? request.mutations.map((mutation) => String(mutation?.id || '')).filter(Boolean) : [] };
   }
   if (!persistenceWorker) persistenceWorker = new PersistenceWorker(profileRoot);
-  return persistenceWorker.enqueue(validation.envelope);
+  return persistenceWorker.enqueue(validation.envelope).then((ack) => {
+    const conflict = ack?.ok && Number(validation.envelope.baseRevision || 0) < Math.max(0, Number(ack.revision || 0) - 1);
+    return { ...ack, conflict, conflictMessage: conflict ? "Base revision was older than the latest saved revision" : "" };
+  });
 });
 
 ipcMain.handle('export:write-json', (_event, request) => writeExportJson(request));
 ipcMain.handle('export:capture-viewport-png', (_event, request) => captureViewportPng(request));
+ipcMain.handle('diagnostics:export-restore-fixture', (_event, request) => exportRestoreFixture(request));
+ipcMain.handle('diagnostics:verify-restore-profile', () => verifyRestoreProfile());
 ipcMain.handle('diagnostics:record-drag-probe', (_event, probe) => {
   const state = safeProfileState();
   if (!state.ready) return { ok: false, error: state.error || 'Profile unavailable' };

@@ -56,6 +56,8 @@ let saveTimer = 0;
 let latestPersistenceRequest = 0;
 let lastAckRevision = Number(state.persistenceRevision || 0);
 let searchState = { open: false, query: "", results: [], selectedIndex: 0 };
+let retrySequence = Number(state.retrySequence || 0);
+let conflictState = { active: false, message: "" };
 
 function startOfDay(date) { return new Date(date.getFullYear(), date.getMonth(), date.getDate()); }
 function padDatePart(value) { return String(value).padStart(2, "0"); }
@@ -113,6 +115,8 @@ function normalizeState(value) {
   value.selectedId ??= null;
   value.activeKeywordId ??= null;
   value.expandedNoteId ??= null;
+  value.retryQueue = Array.isArray(value.retryQueue) ? value.retryQueue : [];
+  value.retrySequence = Number(value.retrySequence || 0);
   value.dragHarness = Array.isArray(value.dragHarness) ? value.dragHarness.slice(0, DRAG_HARNESS_LIMIT) : [];
   return value;
 }
@@ -204,8 +208,71 @@ function findItemAcrossDays(id) {
   for (const board of Object.values(state.days || {})) {
     const item = board.items?.find((candidate) => candidate.id === id || candidate.captureJobId === id);
     if (item) return item;
+    const trashed = board.trash?.find((entry) => entry.item && (entry.item.id === id || entry.item.captureJobId === id));
+    if (trashed?.item) return trashed.item;
   }
   return null;
+}
+function retryQueue() { state.retryQueue ||= []; return state.retryQueue; }
+function retryQueueCount() { return retryQueue().length; }
+function failedMutationsForTarget(targetId) { return retryQueue().filter((entry) => entry.mutation.targetId === targetId); }
+function removeRetryEntries(ids) {
+  if (!ids.length) return;
+  state.retryQueue = retryQueue().filter((entry) => !ids.includes(entry.mutation.id));
+}
+function queueFailedMutations(mutations, error) {
+  const message = error || "Persistence ACK failed";
+  const existing = new Map(retryQueue().map((entry) => [entry.mutation.id, entry]));
+  mutations.forEach((mutation) => {
+    const previous = existing.get(mutation.id);
+    existing.set(mutation.id, {
+      id: mutation.id,
+      order: previous?.order || ++retrySequence,
+      retryCount: previous?.retryCount || 0,
+      dayCanvasId: mutation.dayCanvasId || state.activeDayId,
+      targetId: mutation.targetId || null,
+      mutation,
+      error: message,
+      failedAtUtc: new Date().toISOString()
+    });
+    if (mutation.targetId) {
+      const item = findItemAcrossDays(mutation.targetId);
+      if (item) item.failedMutationIds = [...new Set([...(item.failedMutationIds || []), mutation.id])];
+    }
+  });
+  state.retryQueue = [...existing.values()].sort((a, b) => a.order - b.order);
+  state.retrySequence = retrySequence;
+}
+function clearFailedMutationMarks(ids) {
+  Object.values(state.days || {}).forEach((board) => {
+    [...(board.items || []), ...(board.trash || []).map((entry) => entry.item).filter(Boolean)].forEach((item) => {
+      if (Array.isArray(item.failedMutationIds)) item.failedMutationIds = item.failedMutationIds.filter((id) => !ids.includes(id));
+      if (!item.failedMutationIds?.length) delete item.failedMutationIds;
+      if (!failedMutationsForTarget(item.id).length && item.mutationError) item.mutationError = "";
+    });
+  });
+}
+function updateConflictIndicator(ack) {
+  conflictState.active = Boolean(ack?.conflict);
+  conflictState.message = ack?.conflict ? (ack.conflictMessage || "Snapshot revision was older than the latest ACK") : "";
+  saveState.classList.toggle("conflict", conflictState.active);
+  saveState.title = conflictState.message || saveState.title || "";
+}
+function retryMutations(entries) {
+  if (!entries.length) return;
+  entries.forEach((entry) => { entry.retryCount = (entry.retryCount || 0) + 1; entry.lastRetryAtUtc = new Date().toISOString(); });
+  persist({ immediate: true, mutations: entries.map((entry) => entry.mutation), retrying: true });
+}
+function retryObjectMutations(targetId) { retryMutations(failedMutationsForTarget(targetId)); }
+function retryAllMutations() { retryMutations([...retryQueue()].sort((a, b) => a.order - b.order)); }
+function keepOptimisticObject(targetId) {
+  const ids = failedMutationsForTarget(targetId).map((entry) => entry.mutation.id);
+  removeRetryEntries(ids);
+  clearFailedMutationMarks(ids);
+  const item = findItemAcrossDays(targetId);
+  if (item) item.mutationError = "";
+  saveState.textContent = retryQueueCount() ? "Needs retry" : "Saved";
+  renderCanvas();
 }
 
 function markMutationsPending(mutations) {
@@ -220,7 +287,7 @@ function markMutationsPending(mutations) {
 
 function settleMutations(mutationIds = [], error = "") {
   Object.values(state.days || {}).forEach((board) => {
-    (board.items || []).forEach((item) => {
+    [...(board.items || []), ...(board.trash || []).map((entry) => entry.item).filter(Boolean)].forEach((item) => {
       if (!Array.isArray(item.pendingMutationIds)) return;
       item.pendingMutationIds = item.pendingMutationIds.filter((id) => !mutationIds.includes(id));
       if (!item.pendingMutationIds.length) delete item.pendingMutationIds;
@@ -242,8 +309,12 @@ function persist(input = {}) {
     if (!shellBridge?.saveWorkspaceMutations) {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
       lastAckRevision = Number(snapshot.persistenceRevision || 0);
-      settleMutations(request.mutations.map((mutation) => mutation.id));
-      if (requestId === latestPersistenceRequest) saveState.textContent = "Saved";
+      const mutationIds = request.mutations.map((mutation) => mutation.id);
+      settleMutations(mutationIds);
+      removeRetryEntries(mutationIds);
+      clearFailedMutationMarks(mutationIds);
+      updateConflictIndicator(null);
+      if (requestId === latestPersistenceRequest) saveState.textContent = retryQueueCount() ? "Needs retry" : "Saved";
       refreshOpenSearch();
       renderCanvas();
       return;
@@ -253,17 +324,23 @@ function persist(input = {}) {
       if (!ack?.ok) throw new Error(ack?.details || ack?.error || "Save failed");
       lastAckRevision = Number(ack.revision || lastAckRevision);
       state.persistenceRevision = lastAckRevision;
-      settleMutations(ack.mutationIds || request.mutations.map((mutation) => mutation.id));
+      const ackedIds = ack.mutationIds || request.mutations.map((mutation) => mutation.id);
+      settleMutations(ackedIds);
+      removeRetryEntries(ackedIds);
+      clearFailedMutationMarks(ackedIds);
       saveState.title = "";
-      if (requestId === latestPersistenceRequest) saveState.textContent = "Saved";
+      updateConflictIndicator(ack);
+      if (requestId === latestPersistenceRequest) saveState.textContent = conflictState.active ? "Saved conflict" : retryQueueCount() ? "Needs retry" : "Saved";
       refreshOpenSearch();
       renderCanvas();
     } catch (error) {
       const ids = request.mutations.map((mutation) => mutation.id);
-      settleMutations(ids, error?.message || "Persistence ACK failed");
+      const message = error?.message || "Persistence ACK failed";
+      settleMutations(ids, message);
+      queueFailedMutations(request.mutations, message);
       if (requestId === latestPersistenceRequest) {
         saveState.textContent = "Needs retry";
-        saveState.title = error?.message || "Persistence ACK failed";
+        saveState.title = message + (retryQueueCount() ? ` - ${retryQueueCount()} queued` : "");
       }
       renderCanvas();
     }
@@ -683,6 +760,7 @@ function openProfilePopover(popover) {
     ["Storage", profileState.profileLabel || "Browser preview"],
     ["Metadata", profileState.metadata?.ready ? "SQLite ready" : profileState.ready ? "File fallback" : "Unavailable"],
     ["Recovery", profileState.captureRecovery?.failed?.length ? `${profileState.captureRecovery.failed.length} failed jobs` : "No pending jobs"],
+    ["Restore check", profileState.restoreVerification ? `${profileState.restoreVerification.days} days / ${profileState.restoreVerification.objects} objects` : "Not run"],
     ["Privacy", "Local profile only"]
   ];
   details.forEach(([label, value]) => {
@@ -718,6 +796,30 @@ async function repairMediaIndexFromMenu() {
   }
 }
 
+async function exportRestoreFixtureFromMenu(popover) {
+  if (!shellBridge?.exportRestoreFixture) return;
+  saveState.textContent = "Exporting fixture";
+  try {
+    const result = await shellBridge.exportRestoreFixture({ snapshot: snapshotForPersistence() });
+    if (result?.canceled) { saveState.textContent = "Export canceled"; return; }
+    if (!result?.ok) throw new Error(result?.error || "Fixture export failed");
+    saveState.textContent = "Fixture exported";
+    saveState.title = result.filePath || result.fileName || "";
+    openMorePopover(popover);
+  } catch (error) { saveState.textContent = "Fixture failed"; saveState.title = error?.message || "Fixture export failed"; }
+}
+async function verifyRestoreProfileFromMenu(popover) {
+  if (!shellBridge?.verifyRestoreProfile) return;
+  saveState.textContent = "Verifying profile";
+  try {
+    const result = await shellBridge.verifyRestoreProfile();
+    if (!result?.ok) throw new Error(result?.error || "Verify failed");
+    profileState.restoreVerification = result;
+    saveState.textContent = `Verified ${result.days} days / ${result.objects} objects`;
+    saveState.title = `trash ${result.trash}, media ${result.mediaAssets}, capture jobs ${result.captureJobs}, failed ${result.failedCaptureJobs}`;
+    openProfilePopover(popover);
+  } catch (error) { saveState.textContent = "Verify failed"; saveState.title = error?.message || "Verify failed"; }
+}
 function openMorePopover(popover) {
   popover.innerHTML = "";
   const title = document.createElement("h2");
@@ -730,10 +832,13 @@ function openMorePopover(popover) {
   profile.className = "profile-status-row";
   profile.title = profileState.profileLabel || "Profile unavailable";
   const dragHarness = makePopoverButton("Drag Harness", `${state.dragHarness.length} samples`, () => openDragHarnessPopover(popover));
+  const retrySaves = makePopoverButton("Retry failed saves", retryQueueCount() ? `${retryQueueCount()} queued` : "None", retryAllMutations, !retryQueueCount());
+  const restoreFixture = makePopoverButton("Export restore fixture", shellBridge?.exportRestoreFixture ? "Save As" : "Desktop only", () => exportRestoreFixtureFromMenu(popover), !shellBridge?.exportRestoreFixture);
+  const verifyProfile = makePopoverButton("Verify restore profile", shellBridge?.verifyRestoreProfile ? "Read only" : "Desktop only", () => verifyRestoreProfileFromMenu(popover), !shellBridge?.verifyRestoreProfile);
   const search = makePopoverButton("Search board", searchState.query ? `${searchState.results.length} matches` : "Ctrl / Cmd + F", () => openSearchPopover(popover));
   const keyword = makePopoverButton("Keyword visibility", "Soon", null, true);
   const privacy = makePopoverButton("Data and privacy", "Local only", () => openProfilePopover(popover), !shellBridge);
-  popover.append(title, search, always, profile, dragHarness, keyword, privacy);
+  popover.append(title, search, retrySaves, always, profile, dragHarness, restoreFixture, verifyProfile, keyword, privacy);
 }
 function renderSearchResults(popover) {
   const list = popover.querySelector(".search-results");
@@ -847,6 +952,7 @@ function createImageObject(item) {
   captureMark.title = item.mutationError || item.captureError || item.derivativeError || "";
   frame.append(createKeywordLayer(item), img, lockMark, captureMark);
   if (item.lifecycleState === "FAILED") frame.appendChild(createCaptureActions(item));
+  if (item.mutationError) frame.appendChild(createMutationActions(item));
 
   ["nw", "ne", "sw", "se"].forEach((corner) => {
     const handle = document.createElement("span");
@@ -908,6 +1014,7 @@ function createLinkObject(item) {
   mutationMark.textContent = item.mutationError ? "Retry needed" : "";
   mutationMark.title = item.mutationError || "";
   frame.append(createKeywordLayer(item), mark, title, host, open, lockMark, mutationMark);
+  if (item.mutationError) frame.appendChild(createMutationActions(item));
 
   ["nw", "ne", "sw", "se"].forEach((corner) => {
     const handle = document.createElement("span");
@@ -1005,6 +1112,24 @@ function showLocalFeedback(container, message) {
 }
 function pinKeyword(item, keyword) { item.keywords = [keyword, ...item.keywords.filter((value) => value !== keyword)]; state.activeKeywordId = item.id; renderCanvas(); persist({ type: "keyword.pin", targetId: item.id, payload: { keyword, keywords: [...item.keywords] } }); }
 
+function createMutationActions(item) {
+  const actions = document.createElement("div");
+  actions.className = "mutation-actions";
+  const retry = document.createElement("button");
+  retry.type = "button";
+  retry.textContent = "Retry save";
+  retry.title = item.mutationError || "Retry failed save";
+  retry.addEventListener("pointerdown", (event) => event.stopPropagation());
+  retry.addEventListener("click", (event) => { event.stopPropagation(); retryObjectMutations(item.id); });
+  const keep = document.createElement("button");
+  keep.type = "button";
+  keep.textContent = "Keep";
+  keep.title = "Keep the visible optimistic change and dismiss this retry";
+  keep.addEventListener("pointerdown", (event) => event.stopPropagation());
+  keep.addEventListener("click", (event) => { event.stopPropagation(); keepOptimisticObject(item.id); });
+  actions.append(retry, keep);
+  return actions;
+}
 function createCaptureActions(item) {
   const actions = document.createElement("div");
   actions.className = "capture-actions";
@@ -1519,7 +1644,7 @@ function openTrashPopover(popover) {
     meta.append(label, detail);
     const actions = document.createElement("div");
     actions.className = "trash-actions";
-    if (entry.kind === "image" || entry.kind === "external-image") {
+    if (["image", "link", "external-image"].includes(entry.kind)) {
       const restore = document.createElement("button");
       restore.type = "button";
       restore.textContent = "Restore";
@@ -1532,6 +1657,14 @@ function openTrashPopover(popover) {
       open.textContent = "Open";
       open.addEventListener("click", () => window.open(entry.url || entry.item?.url, "_blank", "noopener"));
       actions.appendChild(open);
+    }
+    if (entry.item?.mutationError || failedMutationsForTarget(entry.item?.id).length) {
+      const retry = document.createElement("button");
+      retry.type = "button";
+      retry.textContent = "Retry save";
+      retry.title = entry.item?.mutationError || "Retry failed trash save";
+      retry.addEventListener("click", () => retryObjectMutations(entry.item.id));
+      actions.appendChild(retry);
     }
     const remove = document.createElement("button");
     remove.type = "button";

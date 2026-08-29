@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "product": "AestheticBoard",
+  "fixtureType": "restore-harness-scenario",
+  "createdAtUtc": "2026-08-29T00:00:00.000Z",
+  "scenario": "staging-residue",
+  "description": "Represents a capture job interrupted while a staging part exists; launch recovery should keep the board usable and mark the job failed.",
+  "stagingParts": [
+    "capture-fixture-staging.part"
+  ],
+  "captureJobs": [
+    {
+      "id": "capture-fixture-staging",
+      "state": "LOCALIZING",
+      "dayCanvasId": "2026-08-29",
+      "sourceType": "fixture",
+      "lastErrorCode": ""
+    }
+  ]
+}

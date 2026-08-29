@@ -21,5 +21,7 @@ contextBridge.exposeInMainWorld('aestheticBoardShell', {
   loadWorkspaceSnapshot: () => ipcRenderer.invoke('persistence:load-snapshot'),
   saveWorkspaceMutations: (request) => ipcRenderer.invoke('persistence:save-mutations', mutationSummary(request)),
   writeExportJson: (request) => ipcRenderer.invoke('export:write-json', { filename: String(request?.filename || ''), content: String(request?.content || '') }),
-  captureViewportPng: (request) => ipcRenderer.invoke('export:capture-viewport-png', { filename: String(request?.filename || '') })
+  captureViewportPng: (request) => ipcRenderer.invoke('export:capture-viewport-png', { filename: String(request?.filename || '') }),
+  exportRestoreFixture: (request) => ipcRenderer.invoke('diagnostics:export-restore-fixture', { snapshot: request?.snapshot && typeof request.snapshot === 'object' ? request.snapshot : null }),
+  verifyRestoreProfile: () => ipcRenderer.invoke('diagnostics:verify-restore-profile')
 });
