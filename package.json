@@ -6,7 +6,7 @@
   "main": "electron/main.cjs",
   "scripts": {
     "start": "electron .",
-    "check": "node --check app.js && node --check server.js && node --check electron/main.cjs && node --check electron/preload.cjs && node --check electron/persistence.cjs && node --check electron/media-store.cjs"
+    "check": "node --check app.js && node --check server.js && node --check electron/main.cjs && node --check electron/preload.cjs && node --check electron/persistence.cjs && node --check electron/media-store.cjs && node --check electron/mutation-contract.cjs"
   },
   "devDependencies": {
     "electron": "^32.3.3"

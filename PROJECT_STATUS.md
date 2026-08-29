@@ -29,9 +29,13 @@ Implemented slices:
 | 15 | Done | Persistence Worker queue with revision ACK. Renderer no longer treats timer-only localStorage writes as desktop Saved. |
 | 16 | Done | Restart recovery from Profile snapshot for active day, camera, image geometry, z-order, lock, note, keyword state, and trash. |
 | 17 | Done | Per-image capture lifecycle UI: Resolving, Localizing, Durable, Failed. Failures remain local to the image object. |
+| 18 | Done | Typed mutation envelopes now replace renderer arbitrary snapshot saves at the preload/main boundary while preserving ACK-based Saved state. |
+| 19 | Done | Capture jobs are persisted as recoverable queue records; launch recovery scans staging/originals and failed jobs remain object-local. |
 
 ## Verified Behaviors
 
+- Typed persistence validation rejects unsupported mutation types before they reach the worker.
+- Capture recovery validation marks interrupted localizing jobs as Failed and repairs durable jobs through the media index.
 - `npm run check` passes across renderer, server, Electron main/preload, persistence, and media-store files.
 - Temporary Profile validation confirms snapshot ACK, SQLite migration/write, recovery read, media index, and app-media path resolution.
 - Desktop drag/link capture issue was diagnosed through Drag Harness and fixed for custom DataTransfer payloads.
@@ -45,55 +49,18 @@ The current codebase is still intentionally lightweight and prototype-shaped:
 - Renderer is implemented in plain `app.js`, not yet split into typed domain modules.
 - Persistence Worker is currently a main-process queue class, not a separate worker thread.
 - SQLite is accessed through `node:sqlite` when available and falls back to file snapshot persistence when unavailable.
-- Profile snapshot is stored as `workspace-snapshot.json`; SQLite also stores a `canvas_state` copy for metadata continuity.
-- Local captured images use `app-media://asset/<assetId>?variant=original`; remote image URL capture remains a reference path and is not yet safely fetched/localized.
+- Profile snapshot is stored as `workspace-snapshot.json`; typed mutation batches append to `logs/mutation-log.jsonl`, and SQLite also stores a `canvas_state` copy for metadata continuity.
+- Local captured images use `app-media://asset/<assetId>?variant=original`; capture job recovery uses `capture-jobs.json` plus the media index to repair interrupted localizing jobs. Remote image URL capture remains a reference path and is not yet safely fetched/localized.
 
 ## Known Technical Debt
 
 - Move the codebase toward the documented process boundaries: main / preload / renderer / persistence / media / domain.
-- Replace broad snapshot writes with typed mutations once the state surface stabilizes.
 - Add a real SQLite driver strategy for Electron runtime if `node:sqlite` is not stable enough for packaging.
 - Add Git LFS or another asset strategy for large font/media files, especially `refer/fonts/系统手写/PingFang.ttc`.
 - Add Playwright/Electron automated checks for restart recovery and drag capture where feasible.
 - Decide whether runtime UI labels remain English or need localized Chinese variants.
 
 ## Next Development Tasks
-
-### Slice 18: Typed Mutation Contract
-
-Goal: replace ad hoc full-state saves with explicit mutation envelopes while keeping the ACK behavior from Slice 15.
-
-Tasks:
-
-1. Define mutation types for day title, camera, create image, create link, move, resize, z-order, lock, note, keyword pin, trash move, trash restore, trash delete, trash clear, and surface change.
-2. Add runtime validation at the preload/main boundary.
-3. Keep renderer optimistic updates, but store pending mutation metadata per object where needed.
-4. Persistence Worker returns revision ACK per coalesced batch.
-5. Keep snapshot fallback as a recovery checkpoint.
-
-Acceptance:
-
-- No renderer call can send arbitrary persistence payloads without validation.
-- Move/resize still write only final state on pointerup.
-- Failed mutation ACK does not erase visible optimistic state; it marks the affected object or control as needing retry.
-
-### Slice 19: Capture Job Recovery Queue
-
-Goal: make failed or interrupted captures recoverable without corrupting saved canvas state.
-
-Tasks:
-
-1. Persist capture job states: QUEUED, RESOLVING, LOCALIZING, DURABLE, FAILED, ABANDONED.
-2. On app launch, scan staging files and incomplete capture jobs.
-3. Resolve orphaned originals against media index by SHA-256.
-4. Restore durable images even if the final UI snapshot write was interrupted.
-5. Show failed capture state locally on the affected image with retry/remove actions.
-
-Acceptance:
-
-- Killing the app during localizing does not break previously saved board objects.
-- Restart never produces duplicate image objects for the same successful capture job.
-- Failed jobs remain inspectable but do not block new captures.
 
 ### Slice 20: Thumbnail / Working Derivatives
 
@@ -166,9 +133,43 @@ Acceptance:
 
 ## Recommended Immediate Order
 
-1. Slice 18: Typed Mutation Contract.
-2. Slice 19: Capture Job Recovery Queue.
-3. Slice 20: Thumbnail / Working Derivatives.
-4. Slice 21: Object-Level Retry And Repair UI.
-5. Slice 22: Search / Filter Foundation.
-6. Slice 23: Export / Share First Pass.
+1. Slice 20: Thumbnail / Working Derivatives.
+2. Slice 21: Object-Level Retry And Repair UI.
+3. Slice 22: Search / Filter Foundation.
+4. Slice 23: Export / Share First Pass.
+5. Slice 24: Mutation Retry Queue And Conflict Surface.
+6. Slice 25: Import / Restore Test Harness.
+
+
+### Slice 24: Mutation Retry Queue And Conflict Surface
+
+Goal: let failed mutation ACKs stay visible and recoverable without undoing optimistic renderer state.
+
+Tasks:
+
+1. Add an explicit retry queue for failed mutation IDs.
+2. Surface object-level retry affordances for failed move, resize, lock, note, keyword, and trash mutations.
+3. Keep retry ordering per day and per object.
+4. Add a compact conflict indicator when a snapshot revision is older than the current ACK.
+
+Acceptance:
+
+- Failed ACKs can be retried without recreating objects.
+- Optimistic object state stays visible until a user chooses a repair action.
+- Retry does not duplicate capture jobs or trash entries.
+
+### Slice 25: Import / Restore Test Harness
+
+Goal: prove Profile recovery paths can be exercised repeatedly without manual file surgery.
+
+Tasks:
+
+1. Add a local-only diagnostics action to export a small restore fixture.
+2. Add test fixtures for snapshot interruption, staging residue, durable media, and failed capture jobs.
+3. Add a read-only verification command that reports restored days, objects, trash, media assets, and capture jobs.
+
+Acceptance:
+
+- A developer can reproduce restart recovery scenarios from fixtures.
+- Verification never mutates the user board.
+- Fixture outputs avoid absolute local media paths unless explicitly requested.

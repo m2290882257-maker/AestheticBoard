@@ -89,6 +89,7 @@ CREATE TABLE IF NOT EXISTS app_preference (
 
 function nowIso() { return new Date().toISOString(); }
 function snapshotPath(profileRoot) { return path.join(profileRoot, 'workspace-snapshot.json'); }
+function mutationLogPath(profileRoot) { return path.join(profileRoot, 'logs', 'mutation-log.jsonl'); }
 
 function writeJsonAtomic(filePath, value) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -235,16 +236,30 @@ function saveSnapshotToSqlite(profileRoot, snapshot, now) {
   }
 }
 
-function saveWorkspaceSnapshot(profileRoot, snapshot) {
+function appendMutationLog(profileRoot, mutations, revision, now) {
+  if (!Array.isArray(mutations) || !mutations.length) return;
+  fs.mkdirSync(path.dirname(mutationLogPath(profileRoot)), { recursive: true });
+  const lines = mutations.map((mutation) => JSON.stringify({ ...mutation, ackRevision: revision, ackedAtUtc: now })).join('\n') + '\n';
+  fs.appendFileSync(mutationLogPath(profileRoot), lines, 'utf8');
+}
+
+function saveWorkspaceSnapshot(profileRoot, snapshot, options = {}) {
   const now = nowIso();
+  const mutations = Array.isArray(options.mutations) ? options.mutations : [];
   const payload = {
     ...(snapshot || {}),
     persistenceRevision: Number(snapshot?.persistenceRevision || 0) + 1,
-    updatedAtUtc: now
+    updatedAtUtc: now,
+    lastMutationBatch: {
+      ids: mutations.map((mutation) => mutation.id),
+      types: mutations.map((mutation) => mutation.type),
+      ackedAtUtc: now
+    }
   };
   writeJsonAtomic(snapshotPath(profileRoot), payload);
+  appendMutationLog(profileRoot, mutations, payload.persistenceRevision, now);
   const sqlite = saveSnapshotToSqlite(profileRoot, payload, now);
-  return { ok: true, revision: payload.persistenceRevision, updatedAtUtc: now, sqlite };
+  return { ok: true, revision: payload.persistenceRevision, updatedAtUtc: now, mutationIds: mutations.map((mutation) => mutation.id), coalescedCount: mutations.length, sqlite };
 }
 
 function loadWorkspaceSnapshot(profileRoot) {

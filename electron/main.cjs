@@ -3,7 +3,8 @@ const fs = require('fs');
 const path = require('path');
 const { pathToFileURL } = require('url');
 const { ensureMetadataStore, insertDurableCapture, saveWorkspaceSnapshot, loadWorkspaceSnapshot } = require('./persistence.cjs');
-const { commitDataUrl, resolveAssetPath } = require('./media-store.cjs');
+const { commitDataUrl, resolveAssetPath, recoverCaptureJobs } = require('./media-store.cjs');
+const { validatePersistenceEnvelope } = require('./mutation-contract.cjs');
 
 const stateFileName = 'workspace-state.json';
 const productProfileId = 'AestheticBoard';
@@ -35,14 +36,18 @@ let persistenceWorker = null;
 class PersistenceWorker {
   constructor(rootProvider) {
     this.rootProvider = rootProvider;
-    this.pendingSnapshot = null;
+    this.pendingEnvelope = null;
     this.pendingResolvers = [];
     this.timer = null;
     this.lastAck = { revision: 0, updatedAtUtc: null };
   }
 
-  enqueue(snapshot) {
-    this.pendingSnapshot = snapshot;
+  enqueue(envelope) {
+    if (this.pendingEnvelope) {
+      this.pendingEnvelope = { ...envelope, mutations: [...this.pendingEnvelope.mutations, ...envelope.mutations], snapshot: envelope.snapshot };
+    } else {
+      this.pendingEnvelope = envelope;
+    }
     return new Promise((resolve) => {
       this.pendingResolvers.push(resolve);
       clearTimeout(this.timer);
@@ -51,22 +56,24 @@ class PersistenceWorker {
   }
 
   flush() {
-    const snapshot = this.pendingSnapshot;
+    const envelope = this.pendingEnvelope;
     const resolvers = this.pendingResolvers.splice(0);
-    this.pendingSnapshot = null;
+    this.pendingEnvelope = null;
     this.timer = null;
     let ack;
     try {
-      ack = saveWorkspaceSnapshot(this.rootProvider(), snapshot || {});
+      ack = saveWorkspaceSnapshot(this.rootProvider(), envelope?.snapshot || {}, { mutations: envelope?.mutations || [] });
       this.lastAck = { revision: ack.revision, updatedAtUtc: ack.updatedAtUtc };
     } catch (error) {
-      ack = { ok: false, error: error?.message || 'Persistence write failed', revision: this.lastAck.revision || 0 };
+      ack = { ok: false, error: error?.message || 'Persistence write failed', revision: this.lastAck.revision || 0, mutationIds: envelope?.mutations?.map((mutation) => mutation.id) || [] };
     }
     resolvers.forEach((resolve) => resolve(ack));
   }
 
   read() {
-    return loadWorkspaceSnapshot(this.rootProvider());
+    const loaded = loadWorkspaceSnapshot(this.rootProvider());
+    if (loaded?.ok) loaded.captureRecovery = recoverCaptureJobs(this.rootProvider());
+    return loaded;
   }
 }
 function localDataRoot() {
@@ -104,6 +111,7 @@ function ensureProfile() {
   fs.mkdirSync(root, { recursive: true });
   profileDirectories.forEach((name) => fs.mkdirSync(path.join(root, name), { recursive: true }));
   const metadata = ensureMetadataStore(root);
+  const captureRecovery = recoverCaptureJobs(root);
   const manifestPath = profileManifestPath();
   const existing = readJsonFile(manifestPath) || {};
   const manifest = {
@@ -275,11 +283,15 @@ ipcMain.handle('persistence:load-snapshot', () => {
   if (!persistenceWorker) persistenceWorker = new PersistenceWorker(profileRoot);
   return persistenceWorker.read();
 });
-ipcMain.handle('persistence:save-snapshot', (_event, snapshot) => {
+ipcMain.handle('persistence:save-mutations', (_event, request) => {
   const state = safeProfileState();
   if (!state.ready) return { ok: false, error: state.error || 'Profile unavailable' };
+  const validation = validatePersistenceEnvelope(request);
+  if (!validation.ok) {
+    return { ok: false, error: 'INVALID_MUTATION_ENVELOPE', details: validation.error, mutationIds: Array.isArray(request?.mutations) ? request.mutations.map((mutation) => String(mutation?.id || '')).filter(Boolean) : [] };
+  }
   if (!persistenceWorker) persistenceWorker = new PersistenceWorker(profileRoot);
-  return persistenceWorker.enqueue(snapshot || {});
+  return persistenceWorker.enqueue(validation.envelope);
 });
 
 ipcMain.handle('diagnostics:record-drag-probe', (_event, probe) => {
@@ -309,7 +321,7 @@ ipcMain.handle('capture:commit-data-url', (_event, request) => {
       height: request?.pixelHeight || 0,
       imageObject: request?.imageObject || {}
     });
-    return { ok: true, ...committed, persistence };
+    return { ok: true, ...committed, persistence, captureJob: committed.captureJob };
   } catch (error) {
     return { ok: false, error: error?.message || 'CAPTURE_COMMIT_FAILED' };
   }

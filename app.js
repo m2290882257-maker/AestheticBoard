@@ -1,4 +1,4 @@
-﻿const ONE_DAY = 24 * 60 * 60 * 1000;
+const ONE_DAY = 24 * 60 * 60 * 1000;
 const STORAGE_KEY = "aesthetic-board.vertical-slice.v2";
 const LEGACY_STORAGE_KEY = "aesthetic-board.vertical-slice.v1";
 const MIN_ZOOM = 0.25;
@@ -123,6 +123,23 @@ function day() {
 function items() { return day().items; }
 function trashItems() { return day().trash; }
 function camera() { return day().camera; }
+function objectMutationPayload(item) {
+  return {
+    id: item.id,
+    kind: item.kind || "image",
+    x: item.x,
+    y: item.y,
+    width: item.width,
+    z: item.z,
+    locked: Boolean(item.locked),
+    note: item.note || "",
+    keywords: [...(item.keywords || [])],
+    lifecycleState: item.lifecycleState || "READY",
+    assetId: item.assetId || "",
+    url: item.url || "",
+    src: item.src || ""
+  };
+}
 
 function applyRecoveredSnapshot(snapshot) {
   if (!snapshot || typeof snapshot !== "object" || !snapshot.days) return false;
@@ -133,35 +150,114 @@ function applyRecoveredSnapshot(snapshot) {
   return true;
 }
 
-function snapshotForPersistence() {
-  return JSON.parse(JSON.stringify({ ...state, persistenceRevision: lastAckRevision }));
+function applyCaptureRecovery(recovery) {
+  if (!recovery?.jobs) return;
+  Object.values(recovery.jobs).forEach((job) => {
+    let item = findItemAcrossDays(job.id);
+    if (!item && job.state === "DURABLE" && job.imageObject) {
+      const board = state.days[job.dayCanvasId] || createDay();
+      state.days[job.dayCanvasId] = board;
+      item = { ...job.imageObject, id: job.imageObject.id || job.id, captureJobId: job.id, kind: job.imageObject.kind || "image", src: job.rendererSrc || job.imageObject.src || "", keywords: [...(job.imageObject.keywords || ["recovered capture"])] };
+      if (!board.items.some((candidate) => candidate.id === item.id || candidate.captureJobId === job.id)) board.items.push(item);
+    }
+    if (!item) return;
+    item.captureJobId = job.id;
+    if (job.state === "DURABLE") {
+      item.lifecycleState = "DURABLE";
+      item.assetId = job.assetId || item.assetId;
+      item.sha256 = job.sha256 || item.sha256;
+      item.originalRelpath = job.originalRelpath || item.originalRelpath;
+      item.src = job.rendererSrc || item.src;
+      item.captureError = "";
+    }
+    if (job.state === "FAILED") {
+      item.lifecycleState = "FAILED";
+      item.captureError = job.lastErrorCode || item.captureError || "Recovered incomplete capture";
+    }
+  });
 }
 
-function persist(options = {}) {
+function snapshotForPersistence() {
+  return JSON.parse(JSON.stringify({ ...state, persistenceRevision: lastAckRevision }, (key, value) => {
+    if (["pendingMutationIds", "mutationError", "pendingDataUrl"].includes(key)) return undefined;
+    return value;
+  }));
+}
+
+function makeMutation(type, payload = {}, targetId = null) {
+  return { id: `mut-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`, type, targetId, dayCanvasId: state.activeDayId, createdAtUtc: new Date().toISOString(), payload };
+}
+
+function normalizePersistInput(input = {}) {
+  if (input.type) return { immediate: Boolean(input.immediate), mutations: [makeMutation(input.type, input.payload || {}, input.targetId || null)] };
+  if (Array.isArray(input.mutations)) return { immediate: Boolean(input.immediate), mutations: input.mutations };
+  return { immediate: Boolean(input.immediate), mutations: [makeMutation("snapshot.checkpoint", { reason: input.reason || "renderer-checkpoint" })] };
+}
+
+function findItemAcrossDays(id) {
+  for (const board of Object.values(state.days || {})) {
+    const item = board.items?.find((candidate) => candidate.id === id || candidate.captureJobId === id);
+    if (item) return item;
+  }
+  return null;
+}
+
+function markMutationsPending(mutations) {
+  mutations.forEach((mutation) => {
+    if (!mutation.targetId) return;
+    const item = findItemAcrossDays(mutation.targetId);
+    if (!item) return;
+    item.pendingMutationIds = [...new Set([...(item.pendingMutationIds || []), mutation.id])];
+    item.mutationError = "";
+  });
+}
+
+function settleMutations(mutationIds = [], error = "") {
+  Object.values(state.days || {}).forEach((board) => {
+    (board.items || []).forEach((item) => {
+      if (!Array.isArray(item.pendingMutationIds)) return;
+      item.pendingMutationIds = item.pendingMutationIds.filter((id) => !mutationIds.includes(id));
+      if (!item.pendingMutationIds.length) delete item.pendingMutationIds;
+      if (error) item.mutationError = error;
+      else if (!item.pendingMutationIds?.length) item.mutationError = "";
+    });
+  });
+}
+
+function persist(input = {}) {
+  const request = normalizePersistInput(input);
   saveState.textContent = "Saving";
+  markMutationsPending(request.mutations);
   clearTimeout(saveTimer);
-  const delay = options.immediate ? 0 : 220;
+  const delay = request.immediate ? 0 : 220;
   saveTimer = setTimeout(async () => {
     const requestId = ++latestPersistenceRequest;
     const snapshot = snapshotForPersistence();
-    if (!shellBridge?.saveWorkspaceSnapshot) {
+    if (!shellBridge?.saveWorkspaceMutations) {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
       lastAckRevision = Number(snapshot.persistenceRevision || 0);
+      settleMutations(request.mutations.map((mutation) => mutation.id));
       if (requestId === latestPersistenceRequest) saveState.textContent = "Saved";
+      renderCanvas();
       return;
     }
     try {
-      const ack = await shellBridge.saveWorkspaceSnapshot(snapshot);
-      if (!ack?.ok) throw new Error(ack?.error || "Save failed");
+      const ack = await shellBridge.saveWorkspaceMutations({ schemaVersion: 1, clientId: "renderer", baseRevision: lastAckRevision, mutations: request.mutations, snapshot });
+      if (!ack?.ok) throw new Error(ack?.details || ack?.error || "Save failed");
       lastAckRevision = Number(ack.revision || lastAckRevision);
       state.persistenceRevision = lastAckRevision;
+      settleMutations(ack.mutationIds || request.mutations.map((mutation) => mutation.id));
       saveState.title = "";
       if (requestId === latestPersistenceRequest) saveState.textContent = "Saved";
+      renderCanvas();
     } catch (error) {
+      const ids = request.mutations.map((mutation) => mutation.id);
+      settleMutations(ids, error?.message || "Persistence ACK failed");
       if (requestId === latestPersistenceRequest) {
-        saveState.textContent = "Save failed";
+        saveState.textContent = "Needs retry";
         saveState.title = error?.message || "Persistence ACK failed";
       }
+      renderCanvas();
     }
   }, delay);
 }
@@ -294,7 +390,7 @@ function recordDragHarness(stage, event, extra = {}) {
   const probe = makeDragProbe(stage, event, extra);
   state.dragHarness.unshift(probe);
   state.dragHarness = state.dragHarness.slice(0, DRAG_HARNESS_LIMIT);
-  persist();
+  persist({ type: "drag.harness", payload: { stage: probe.stage, priority: probe.candidate?.priority || "none" } });
   if (shellBridge?.recordDragProbe) {
     shellBridge.recordDragProbe(probe).catch(() => {});
   }
@@ -339,9 +435,11 @@ function isLikelyImageUrl(value) {
 }
 
 function addTrashRecord(record) {
-  trashItems().unshift({ trashId: makeTrashId(record.kind || "trash"), trashedAt: new Date().toISOString(), ...record });
+  const entry = { trashId: makeTrashId(record.kind || "trash"), trashedAt: new Date().toISOString(), ...record };
+  trashItems().unshift(entry);
   saveState.textContent = "Moved to Trash";
-  persist();
+  persist({ type: "trash.move", targetId: entry.item?.id || null, payload: { trashId: entry.trashId, kind: entry.kind, label: entry.label || "" } });
+  return entry;
 }
 
 function moveImageToTrash(id) {
@@ -377,7 +475,7 @@ async function restoreTrashItem(trashId) {
   }
   saveState.textContent = "Restored";
   openActionPopover(trashButton);
-  persist();
+  persist({ type: "trash.restore", targetId: entry.item?.id || null, payload: { trashId, kind: entry.kind } });
 }
 
 function permanentlyDeleteTrashItem(trashId) {
@@ -387,7 +485,7 @@ function permanentlyDeleteTrashItem(trashId) {
   currentTrash.splice(index, 1);
   saveState.textContent = "Deleted";
   openActionPopover(trashButton);
-  persist();
+  persist({ type: "trash.delete", payload: { trashId } });
 }
 
 function clearTrash() {
@@ -395,7 +493,7 @@ function clearTrash() {
   day().trash = [];
   saveState.textContent = "Trash cleared";
   openActionPopover(trashButton);
-  persist();
+  persist({ type: "trash.clear", payload: { clearedAt: new Date().toISOString() } });
 }
 
 async function storeDropInTrash(event) {
@@ -439,7 +537,10 @@ async function initializeShellBridge() {
   }
   try {
     const recovered = await shellBridge.loadWorkspaceSnapshot?.();
-    if (recovered?.ok && applyRecoveredSnapshot(recovered.snapshot)) saveState.textContent = "Recovered";
+    if (recovered?.ok && applyRecoveredSnapshot(recovered.snapshot)) {
+      applyCaptureRecovery(recovered.captureRecovery || profileState.captureRecovery);
+      saveState.textContent = "Recovered";
+    }
   } catch {
     // A missing or failed snapshot keeps the immediate renderer fallback state.
   }
@@ -451,7 +552,7 @@ async function toggleAlwaysOnTop() {
   try {
     shellState = await shellBridge.setAlwaysOnTop(!shellState.alwaysOnTop);
     openActionPopover(document.querySelector('[data-popover="more"]'));
-    persist();
+    persist({ type: "workspace.alwaysOnTop", payload: { value: Boolean(shellState.alwaysOnTop) } });
   } catch {
     saveState.textContent = "Window update failed";
     setTimeout(() => { saveState.textContent = "Saved"; }, 1400);
@@ -568,6 +669,8 @@ function createImageObject(item) {
   object.classList.toggle("capture-localizing", item.lifecycleState === "LOCALIZING");
   object.classList.toggle("capture-failed", item.lifecycleState === "FAILED");
   object.classList.toggle("capture-durable", item.lifecycleState === "DURABLE" || item.lifecycleState === "ORIGINAL_LOCAL");
+  object.classList.toggle("mutation-pending", Boolean(item.pendingMutationIds?.length));
+  object.classList.toggle("mutation-failed", Boolean(item.mutationError));
   object.tabIndex = 0;
   object.setAttribute("role", "group");
   object.setAttribute("aria-label", `${item.keywords?.[0] || "Captured image"}${item.locked ? ", locked" : ""}`);
@@ -592,8 +695,10 @@ function createImageObject(item) {
   lockMark.textContent = "Locked";
   const captureMark = document.createElement("span");
   captureMark.className = "capture-state-mark";
-  captureMark.textContent = captureStateLabel(item);
+  captureMark.textContent = item.mutationError ? "Retry needed" : captureStateLabel(item);
+  captureMark.title = item.mutationError || item.captureError || "";
   frame.append(createKeywordLayer(item), img, lockMark, captureMark);
+  if (item.lifecycleState === "FAILED") frame.appendChild(createCaptureActions(item));
 
   ["nw", "ne", "sw", "se"].forEach((corner) => {
     const handle = document.createElement("span");
@@ -619,6 +724,8 @@ function createLinkObject(item) {
   object.classList.toggle("selected", state.selectedId === item.id);
   object.classList.toggle("locked", item.locked);
   object.classList.toggle("keywords-open", state.activeKeywordId === item.id);
+  object.classList.toggle("mutation-pending", Boolean(item.pendingMutationIds?.length));
+  object.classList.toggle("mutation-failed", Boolean(item.mutationError));
   object.tabIndex = 0;
   object.setAttribute("role", "group");
   object.setAttribute("aria-label", (item.label || "Captured link") + (item.locked ? ", locked" : ""));
@@ -647,7 +754,11 @@ function createLinkObject(item) {
   const lockMark = document.createElement("span");
   lockMark.className = "lock-mark";
   lockMark.textContent = "Locked";
-  frame.append(createKeywordLayer(item), mark, title, host, open, lockMark);
+  const mutationMark = document.createElement("span");
+  mutationMark.className = "capture-state-mark";
+  mutationMark.textContent = item.mutationError ? "Retry needed" : "";
+  mutationMark.title = item.mutationError || "";
+  frame.append(createKeywordLayer(item), mark, title, host, open, lockMark, mutationMark);
 
   ["nw", "ne", "sw", "se"].forEach((corner) => {
     const handle = document.createElement("span");
@@ -713,7 +824,7 @@ function createQuickNote(item) {
   editor.ariaLabel = "Edit quick note";
   editor.placeholder = "Quick note";
   editor.addEventListener("pointerdown", (event) => event.stopPropagation());
-  editor.addEventListener("blur", () => { item.note = editor.value.trim(); note.classList.remove("editing"); renderCanvas(); persist(); });
+  editor.addEventListener("blur", () => { item.note = editor.value.trim(); note.classList.remove("editing"); renderCanvas(); persist({ type: "object.note", targetId: item.id, payload: { note: item.note } }); });
   editor.addEventListener("keydown", (event) => { if (event.key === "Escape" || (event.key === "Enter" && (event.metaKey || event.ctrlKey))) editor.blur(); });
   const toggle = document.createElement("button");
   toggle.className = "note-toggle";
@@ -743,7 +854,55 @@ function showLocalFeedback(container, message) {
   container.appendChild(feedback);
   setTimeout(() => feedback.remove(), 1100);
 }
-function pinKeyword(item, keyword) { item.keywords = [keyword, ...item.keywords.filter((value) => value !== keyword)]; state.activeKeywordId = item.id; renderCanvas(); persist(); }
+function pinKeyword(item, keyword) { item.keywords = [keyword, ...item.keywords.filter((value) => value !== keyword)]; state.activeKeywordId = item.id; renderCanvas(); persist({ type: "keyword.pin", targetId: item.id, payload: { keyword, keywords: [...item.keywords] } }); }
+
+function createCaptureActions(item) {
+  const actions = document.createElement("div");
+  actions.className = "capture-actions";
+  const retry = document.createElement("button");
+  retry.type = "button";
+  retry.textContent = "Retry";
+  retry.addEventListener("pointerdown", (event) => event.stopPropagation());
+  retry.addEventListener("click", async (event) => {
+    event.stopPropagation();
+    await retryCapture(item);
+  });
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.textContent = "Remove";
+  remove.addEventListener("pointerdown", (event) => event.stopPropagation());
+  remove.addEventListener("click", (event) => {
+    event.stopPropagation();
+    moveImageToTrash(item.id);
+  });
+  actions.append(retry, remove);
+  return actions;
+}
+
+async function retryCapture(item) {
+  item.captureError = "";
+  if (item.pendingDataUrl || String(item.src || "").startsWith("data:image/")) {
+    const src = item.pendingDataUrl || item.src;
+    item.lifecycleState = "LOCALIZING";
+    renderCanvas();
+    const naturalSize = await imageSizeFromSource(src);
+    await commitLocalCapture(item, src, naturalSize, item.sourceType || "retry", { retryOf: item.captureJobId || item.id });
+    return;
+  }
+  if (new RegExp("^https?://", "i").test(item.src || "")) {
+    item.lifecycleState = "RESOLVING";
+    renderCanvas();
+    const naturalSize = await imageSizeFromSource(item.src);
+    item.width = comfortableInitialWidth(naturalSize.width, naturalSize.height);
+    item.lifecycleState = "REMOTE_REFERENCE";
+    persist({ type: "capture.lifecycle", targetId: item.id, payload: { state: item.lifecycleState, src: item.src, retry: true } });
+    renderCanvas();
+    return;
+  }
+  item.captureError = "No retry source available";
+  persist({ type: "capture.lifecycle", targetId: item.id, payload: { state: item.lifecycleState, error: item.captureError, retry: true } });
+  renderCanvas();
+}
 
 function captureStateLabel(item) {
   if (item.lifecycleState === "RESOLVING") return "Resolving";
@@ -827,7 +986,9 @@ function endPointer(event) {
   }
   if (completedIntent.type === "move") completedIntent.item.z = Math.max(...items().map((item) => item.z), 0) + 1;
   renderCanvas();
-  persist();
+  if (completedIntent.type === "move") persist({ type: "object.move", targetId: completedIntent.item.id, payload: { x: completedIntent.item.x, y: completedIntent.item.y, z: completedIntent.item.z } });
+  else if (completedIntent.type === "resize") persist({ type: "object.resize", targetId: completedIntent.item.id, payload: { x: completedIntent.item.x, y: completedIntent.item.y, width: completedIntent.item.width } });
+  else persist({ type: "camera.update", payload: { camera: { ...camera() } } });
 }
 
 function getSelectedItem() {
@@ -844,7 +1005,7 @@ function zoomAtViewportCenter(multiplier) {
   cam.y = Math.round(centerY - before.y * nextZoom);
   cam.zoom = Number(nextZoom.toFixed(3));
   renderCamera();
-  persist();
+  persist({ type: "camera.update", payload: { camera: { ...camera() }, source: "keyboard" } });
 }
 
 function moveSelectedByKeyboard(event) {
@@ -862,7 +1023,7 @@ function moveSelectedByKeyboard(event) {
   item.y += vector[1];
   item.z = Math.max(...items().map((value) => value.z), 0) + 1;
   renderCanvas();
-  persist();
+  persist({ type: "object.move", targetId: item.id, payload: { x: item.x, y: item.y, z: item.z, keyboard: true } });
   return true;
 }
 
@@ -908,9 +1069,9 @@ function handleWheelZoom(event) {
   cam.x = Math.round(event.clientX - before.x * nextZoom);
   cam.y = Math.round(event.clientY - before.y * nextZoom);
   cam.zoom = Number(nextZoom.toFixed(3));
-  renderCamera(); persist();
+  renderCamera(); persist({ type: "camera.update", payload: { camera: { ...camera() }, source: "wheel" } });
 }
-function resetCamera() { day().camera = { ...DEFAULT_CAMERA }; renderCamera(); persist(); }
+function resetCamera() { day().camera = { ...DEFAULT_CAMERA }; renderCamera(); persist({ type: "camera.reset", payload: { camera: { ...day().camera } } }); }
 
 function comfortableInitialWidth(naturalWidth, naturalHeight) {
   const cam = camera();
@@ -942,12 +1103,14 @@ function createCapturedImage(src, naturalSize, sourceType, worldPoint = null, op
     keywords: sourceType === "browser-drag" ? ["browser drag", "image first", "drop position", "visual capture", "quiet archive"] : ["clipboard paste", "image first", "unsorted reference", "visual capture", "quiet archive"],
     note: "",
     lifecycleState: options.lifecycleState || "READY",
-    captureError: ""
+    captureError: "",
+    captureJobId: options.captureJobId || id,
+    pendingDataUrl: String(src || "").startsWith("data:image/") ? src : ""
   };
   currentDay.items.push(item);
   currentDay.pasteSequence += 1;
   state.selectedId = id; state.activeKeywordId = null; state.expandedNoteId = null;
-  renderCanvas(); persist();
+  renderCanvas(); persist({ type: "object.createImage", targetId: item.id, payload: objectMutationPayload(item), immediate: true });
   return item;
 }
 
@@ -974,7 +1137,7 @@ function createCapturedLink(url, worldPoint = null) {
   currentDay.items.push(item);
   currentDay.pasteSequence += 1;
   state.selectedId = id; state.activeKeywordId = null; state.expandedNoteId = null;
-  renderCanvas(); persist();
+  renderCanvas(); persist({ type: "object.createLink", targetId: item.id, payload: objectMutationPayload(item), immediate: true });
 }
 
 function firstUrlFromHtml(html) {
@@ -1008,8 +1171,9 @@ async function commitLocalCapture(item, dataUrl, naturalSize, sourceType, candid
   renderCanvas();
   try {
     const height = item.width * ((naturalSize.height || 1) / (naturalSize.width || 1));
+    item.captureJobId = item.captureJobId || item.id;
     const response = await shellBridge.commitCapturedMedia({
-      captureId: item.id,
+      captureId: item.captureJobId || item.id,
       dayCanvasId: state.activeDayId,
       boardDate: state.activeDayId,
       sourceType,
@@ -1038,6 +1202,8 @@ async function commitLocalCapture(item, dataUrl, naturalSize, sourceType, candid
     item.sha256 = response.sha256;
     item.originalRelpath = response.originalRelpath;
     item.byteLength = response.byteLength;
+    item.captureJobId = response.captureJob?.id || item.captureJobId || item.id;
+    item.pendingDataUrl = "";
     item.src = response.rendererSrc || item.src;
     item.lifecycleState = response.persistence?.ok ? "DURABLE" : "ORIGINAL_LOCAL";
     item.captureError = response.persistence?.ok ? "" : (response.persistence?.error || "SQLite unavailable");
@@ -1048,14 +1214,14 @@ async function commitLocalCapture(item, dataUrl, naturalSize, sourceType, candid
     saveState.textContent = "Capture saved on board only";
   }
   renderCanvas();
-  persist();
+  persist({ type: "capture.lifecycle", targetId: item.id, payload: { state: item.lifecycleState, assetId: item.assetId || "", error: item.captureError || "", captureJobId: item.captureJobId || item.id } });
 }
 
 async function captureFile(file, sourceType, worldPoint) {
   saveState.textContent = sourceType === "browser-drag" ? "Dropping" : "Pasting";
   const src = await readFileAsDataUrl(file);
   const naturalSize = await imageSizeFromSource(src);
-  const item = createCapturedImage(src, naturalSize, sourceType, worldPoint, { lifecycleState: shellBridge?.commitCapturedMedia ? "LOCALIZING" : "READY" });
+  const item = createCapturedImage(src, naturalSize, sourceType, worldPoint, { lifecycleState: shellBridge?.commitCapturedMedia ? "LOCALIZING" : "READY", captureJobId: `capture-${Date.now()}-${Math.random().toString(16).slice(2, 7)}` });
   await commitLocalCapture(item, src, naturalSize, sourceType, { fileName: file.name || "untitled", fileType: file.type || "", byteLength: file.size || 0 });
 }
 async function captureRemoteUrl(url, worldPoint) {
@@ -1071,7 +1237,7 @@ async function captureRemoteUrl(url, worldPoint) {
     item.captureError = error?.message || "Remote resolve failed";
   }
   renderCanvas();
-  persist();
+  persist({ type: "capture.lifecycle", targetId: item.id, payload: { state: item.lifecycleState, error: item.captureError || "", src: item.src } });
 }
 
 async function handlePaste(event) {
@@ -1109,7 +1275,7 @@ async function handleDrop(event) {
 function shiftDay(days) {
   state.activeDayId = dateKeyFromDate(new Date(activeDate().getTime() + days * ONE_DAY));
   state.selectedId = null; state.activeKeywordId = null; state.expandedNoteId = null;
-  day(); renderChrome(); renderCanvas(); persist();
+  day(); renderChrome(); renderCanvas(); persist({ type: "day.select", payload: { activeDayId: state.activeDayId } });
 }
 
 function openContextMenu(event, item) {
@@ -1119,9 +1285,9 @@ function openContextMenu(event, item) {
   menu.style.left = `${Math.min(event.clientX, window.innerWidth - 250)}px`;
   menu.style.top = `${Math.min(event.clientY, window.innerHeight - 190)}px`;
   menu.innerHTML = `<h2>${item.kind === "link" ? "Link" : "Image"}</h2><button type="button" data-action="lock">${item.locked ? "Unlock" : "Lock"}</button><button type="button" data-action="note">Edit Note</button><button type="button" data-action="front">Bring to Front</button>${item.kind === "link" ? `<button type="button" data-action="open">Open Link</button>` : ""}<button type="button" data-action="trash">Move to Trash</button>`;
-  menu.querySelector('[data-action="lock"]').addEventListener("click", () => { item.locked = !item.locked; closePopovers(); renderCanvas(); persist(); });
+  menu.querySelector('[data-action="lock"]').addEventListener("click", () => { item.locked = !item.locked; closePopovers(); renderCanvas(); persist({ type: "object.lock", targetId: item.id, payload: { locked: item.locked } }); });
   menu.querySelector('[data-action="note"]').addEventListener("click", () => { closePopovers(); state.expandedNoteId = item.id; renderCanvas(); editNote(canvas.querySelector(`[data-id="${item.id}"] .quick-note`), item); });
-  menu.querySelector('[data-action="front"]').addEventListener("click", () => { item.z = Math.max(...items().map((value) => value.z), 0) + 1; closePopovers(); renderCanvas(); persist(); });
+  menu.querySelector('[data-action="front"]').addEventListener("click", () => { item.z = Math.max(...items().map((value) => value.z), 0) + 1; closePopovers(); renderCanvas(); persist({ type: "object.zOrder", targetId: item.id, payload: { z: item.z } }); });
   menu.querySelector('[data-action="open"]')?.addEventListener("click", () => { window.open(item.url, "_blank", "noopener"); closePopovers(); });
   menu.querySelector('[data-action="trash"]').addEventListener("click", () => { closePopovers(); moveImageToTrash(item.id); });
   popoverLayer.appendChild(menu);
@@ -1224,7 +1390,7 @@ function openActionPopover(trigger) {
       button.type = "button";
       button.innerHTML = `<span>${surface.label}</span><span class="surface-state">${surface.status === "default" ? "Default" : surface.status === "experimental" ? "Trial" : ""}</span><span class="surface-swatch" style="background-image:${surface.image ? `url('${surface.image}')` : "none"};background-color:#f4f1e9"></span>`;
       button.classList.toggle("selected-surface", state.surface === id);
-      button.addEventListener("click", () => { state.surface = id; closePopovers(); renderChrome(); persist(); });
+      button.addEventListener("click", () => { state.surface = id; closePopovers(); renderChrome(); persist({ type: "surface.change", payload: { surface: id } }); });
       popover.appendChild(button);
     });
   }
@@ -1235,11 +1401,11 @@ function openActionPopover(trigger) {
 function closePopovers() { popoverLayer.innerHTML = ""; }
 
 titleButton.addEventListener("click", () => { titleArea.classList.add("editing"); titleEditor.value = day().title; titleEditor.placeholder = formatMainDate(activeDate()); titleEditor.style.width = `${Math.max(240, titleButton.offsetWidth + 24)}px`; titleEditor.focus(); });
-titleEditor.addEventListener("blur", () => { day().title = titleEditor.value.trim(); titleArea.classList.remove("editing"); renderChrome(); persist(); });
+titleEditor.addEventListener("blur", () => { day().title = titleEditor.value.trim(); titleArea.classList.remove("editing"); renderChrome(); persist({ type: "day.title", payload: { title: day().title } }); });
 titleEditor.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === "Escape") titleEditor.blur(); });
 document.querySelector("#prev-day").addEventListener("click", () => shiftDay(-1));
 document.querySelector("#next-day").addEventListener("click", () => shiftDay(1));
-document.querySelector("#today").addEventListener("click", () => { state.activeDayId = dateKeyFromDate(new Date()); state.selectedId = null; state.activeKeywordId = null; state.expandedNoteId = null; day(); renderChrome(); renderCanvas(); persist(); });
+document.querySelector("#today").addEventListener("click", () => { state.activeDayId = dateKeyFromDate(new Date()); state.selectedId = null; state.activeKeywordId = null; state.expandedNoteId = null; day(); renderChrome(); renderCanvas(); persist({ type: "day.select", payload: { activeDayId: state.activeDayId, today: true } }); });
 resetView.addEventListener("click", resetCamera);
 boardShell.addEventListener("wheel", handleWheelZoom, { passive: false });
 boardShell.addEventListener("pointerdown", beginPan);
@@ -1262,16 +1428,3 @@ initializeShellBridge().finally(() => {
   renderChrome();
   renderCanvas();
 });
-
-
-
-
-
-
-
-
-
-
-
-
-
