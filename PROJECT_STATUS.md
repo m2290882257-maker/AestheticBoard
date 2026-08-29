@@ -37,6 +37,7 @@ Implemented slices:
 | 23 | Done | Download / Share can export current-day JSON locally and desktop viewport PNG without mutating board state; desktop exports use a Save As dialog. |
 | 24 | Done | Failed mutation ACKs are kept in an ordered retry queue with object-level Retry save / Keep actions and a compact conflict indicator. |
 | 25 | Done | Restore harness can export sanitized Profile fixtures and run a read-only Profile verification summary. |
+| 26 | Done | Remote image URLs are captured immediately as references, then localized through the capture job/media derivative pipeline when supported. |
 
 ## Verified Behaviors
 
@@ -52,6 +53,7 @@ Implemented slices:
 - Export JSON omits absolute local media paths; desktop JSON and PNG exports open a Save As dialog so the user chooses the destination folder.
 - Failed save ACKs now remain visible without reverting optimistic object state, and can be retried globally or per object.
 - Restore diagnostics can export sanitized fixture JSON and verify days, objects, trash, media assets, and capture jobs without mutating the board.
+- Remote image URL drops stay visible immediately, then localize in the desktop main process with URL, type, size, and magic-byte validation; unsupported URLs remain object-local failures with retry/keep actions.
 
 ## Current Architecture Reality
 
@@ -61,7 +63,7 @@ The current codebase is still intentionally lightweight and prototype-shaped:
 - Persistence Worker is currently a main-process queue class, not a separate worker thread.
 - SQLite is accessed through `node:sqlite` when available and falls back to file snapshot persistence when unavailable.
 - Profile snapshot is stored as `workspace-snapshot.json`; typed mutation batches append to `logs/mutation-log.jsonl`, and SQLite also stores a `canvas_state` copy for metadata continuity.
-- Local captured images render through `app-media://asset/<assetId>?variant=working` with fallback to original; capture job recovery uses `capture-jobs.json` plus the media index to repair interrupted localizing jobs. Remote image URL capture remains a reference path and is not yet safely fetched/localized.
+- Local and supported remote captured images render through `app-media://asset/<assetId>?variant=working` with fallback to original; capture job recovery uses `capture-jobs.json` plus the media index to repair interrupted localizing jobs. Unsupported remote URL capture remains a reference path with object-local retry.
 - Search is currently a renderer-built read-only index over the loaded snapshot, not a dedicated SQLite FTS table yet.
 - Export is local-only: JSON works in browser preview or desktop; PNG capture is desktop-only through Electron `capturePage`; desktop exports ask for a save path before writing.
 - Mutation retry is renderer-managed over the current optimistic state; a future pass can move retry metadata into a dedicated durable retry table.
@@ -79,25 +81,8 @@ The current codebase is still intentionally lightweight and prototype-shaped:
 
 ## Recommended Immediate Order
 
-1. Slice 26: Remote URL Localization Adapter.
-2. Slice 27: SQLite Search Index / FTS Upgrade.
-3. Slice 28: Import First Pass.
-4. Slice 29: Durable Mutation Retry Metadata.
-5. Slice 30: Export Full-Day Renderer.
-
-### Slice 26: Remote URL Localization Adapter
-
-Goal: convert supported remote image references into durable local media without blocking drag/drop.
-
-Tasks:
-
-1. Add a main-process fetch/localize path for remote image URLs with type and size validation.
-2. Reuse the capture job queue for remote URL jobs.
-3. Keep unsupported or failed remote URLs as references with object-local retry.
-4. Generate working/thumbnail derivatives after localization succeeds.
-
-Acceptance:
-
-- Remote image localization never blocks new captures.
-- Unsupported remote URLs remain usable as references.
-- Successful remote localization produces the same media index and derivative records as local captures.
+1. Slice 27: SQLite Search Index / FTS Upgrade.
+2. Slice 28: Import First Pass.
+3. Slice 29: Durable Mutation Retry Metadata.
+4. Slice 30: Export Full-Day Renderer.
+5. Slice 31: Remote URL Fetch Policy And Host Controls.

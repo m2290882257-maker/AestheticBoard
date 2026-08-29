@@ -538,7 +538,8 @@
 
 .image-object.capture-localizing .capture-state-mark,
 .image-object.capture-failed .capture-state-mark,
-.image-object.capture-durable.selected .capture-state-mark {
+.image-object.capture-durable.selected .capture-state-mark,
+.image-object.capture-reference.selected .capture-state-mark {
   display: block;
 }
 

@@ -17,6 +17,7 @@ contextBridge.exposeInMainWorld('aestheticBoardShell', {
   getProfileState: () => ipcRenderer.invoke('profile:get-state'),
   recordDragProbe: (probe) => ipcRenderer.invoke('diagnostics:record-drag-probe', probe),
   commitCapturedMedia: (request) => ipcRenderer.invoke('capture:commit-data-url', request),
+  localizeRemoteImage: (request) => ipcRenderer.invoke('capture:localize-remote-url', { ...(request || {}), url: String(request?.url || '') }),
   repairMediaIndex: () => ipcRenderer.invoke('media:repair-index'),
   loadWorkspaceSnapshot: () => ipcRenderer.invoke('persistence:load-snapshot'),
   saveWorkspaceMutations: (request) => ipcRenderer.invoke('persistence:save-mutations', mutationSummary(request)),

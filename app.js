@@ -141,6 +141,7 @@ function objectMutationPayload(item) {
     keywords: [...(item.keywords || [])],
     lifecycleState: item.lifecycleState || "READY",
     assetId: item.assetId || "",
+    sourceUrl: item.sourceUrl || "",
     url: item.url || "",
     src: item.src || "",
     originalSrc: item.originalSrc || "",
@@ -357,7 +358,7 @@ function dateFromDayId(dayId) {
 function normalizeSearchText(value) { return String(value || "").toLowerCase().replace(/\s+/g, " ").trim(); }
 function hostFromUrl(value) { try { return new URL(String(value || "")).host; } catch { return ""; } }
 function objectSearchText(item, board, dayId) {
-  return [item.kind || "image", item.sourceType || "", item.label || "", item.url || "", hostFromUrl(item.url), item.note || "", (item.keywords || []).join(" "), item.capturedAtUtc || item.createdAtUtc || "", dayId, board.title || "", formatMainDate(dateFromDayId(dayId))].join(" ");
+  return [item.kind || "image", item.sourceType || "", item.label || "", item.url || "", item.sourceUrl || "", hostFromUrl(item.url || item.sourceUrl), item.note || "", (item.keywords || []).join(" "), item.capturedAtUtc || item.createdAtUtc || "", dayId, board.title || "", formatMainDate(dateFromDayId(dayId))].join(" ");
 }
 function buildSearchIndex() {
   const entries = [];
@@ -919,6 +920,7 @@ function createImageObject(item) {
   object.classList.toggle("keywords-open", state.activeKeywordId === item.id);
   object.classList.toggle("capture-resolving", item.lifecycleState === "RESOLVING");
   object.classList.toggle("capture-localizing", item.lifecycleState === "LOCALIZING");
+  object.classList.toggle("capture-reference", item.lifecycleState === "REMOTE_REFERENCE");
   object.classList.toggle("capture-failed", item.lifecycleState === "FAILED");
   object.classList.toggle("capture-durable", item.lifecycleState === "DURABLE" || item.lifecycleState === "ORIGINAL_LOCAL");
   object.classList.toggle("mutation-pending", Boolean(item.pendingMutationIds?.length));
@@ -1186,9 +1188,7 @@ async function retryCapture(item) {
     renderCanvas();
     const naturalSize = await imageSizeFromSource(item.src);
     item.width = comfortableInitialWidth(naturalSize.width, naturalSize.height);
-    item.lifecycleState = "REMOTE_REFERENCE";
-    persist({ type: "capture.lifecycle", targetId: item.id, payload: { state: item.lifecycleState, src: item.src, retry: true } });
-    renderCanvas();
+    await localizeRemoteCapture(item, item.src, naturalSize, { retryOf: item.captureJobId || item.id });
     return;
   }
   item.captureError = "No retry source available";
@@ -1199,6 +1199,7 @@ async function retryCapture(item) {
 function captureStateLabel(item) {
   if (item.lifecycleState === "RESOLVING") return "Resolving";
   if (item.lifecycleState === "LOCALIZING") return "Localizing";
+  if (item.lifecycleState === "REMOTE_REFERENCE") return "Reference";
   if (item.lifecycleState === "FAILED") return "Failed";
   if (item.lifecycleState === "DURABLE") return "Durable";
   if (item.lifecycleState === "ORIGINAL_LOCAL") return "Local";
@@ -1393,12 +1394,13 @@ function createCapturedImage(src, naturalSize, sourceType, worldPoint = null, op
     width,
     z: Math.max(...items().map((value) => value.z), 0) + 1,
     locked: false,
-    keywords: sourceType === "browser-drag" ? ["browser drag", "image first", "drop position", "visual capture", "quiet archive"] : ["clipboard paste", "image first", "unsorted reference", "visual capture", "quiet archive"],
+    keywords: sourceType === "remote-url" ? ["remote image", "image first", "url capture", "visual capture", "quiet archive"] : sourceType === "browser-drag" ? ["browser drag", "image first", "drop position", "visual capture", "quiet archive"] : ["clipboard paste", "image first", "unsorted reference", "visual capture", "quiet archive"],
     note: "",
     lifecycleState: options.lifecycleState || "READY",
     captureError: "",
     captureJobId: options.captureJobId || id,
-    pendingDataUrl: String(src || "").startsWith("data:image/") ? src : ""
+    pendingDataUrl: String(src || "").startsWith("data:image/") ? src : "",
+    sourceUrl: options.sourceUrl || ""
   };
   currentDay.items.push(item);
   currentDay.pasteSequence += 1;
@@ -1458,6 +1460,60 @@ function firstUrlFromDrop(dataTransfer) {
   return dataTransferTypeSamples(dataTransfer).find((sample) => sample.url)?.url || "";
 }
 
+function captureImageObjectPayload(item, naturalSize, lifecycleState = "DURABLE") {
+  const height = item.width * ((naturalSize.height || 1) / (naturalSize.width || 1));
+  return { id: item.id, sourceType: item.sourceType || "remote-url", sourceUrl: item.sourceUrl || item.src || "", capturedAt: item.capturedAt, x: item.x, y: item.y, width: item.width, height, z: item.z, locked: item.locked, note: item.note, keywords: item.keywords, lifecycleState, revision: 1 };
+}
+function applyLocalizedCaptureResponse(item, response) {
+  item.assetId = response.assetId;
+  item.sha256 = response.sha256;
+  item.originalRelpath = response.originalRelpath;
+  item.byteLength = response.byteLength;
+  item.captureJobId = response.captureJob?.id || item.captureJobId || item.id;
+  item.pendingDataUrl = "";
+  item.originalSrc = response.originalRendererSrc || (response.assetId ? `app-media://asset/${response.assetId}?variant=original` : item.originalSrc);
+  item.thumbnailSrc = response.thumbnailSrc || (response.assetId ? `app-media://asset/${response.assetId}?variant=thumbnail` : item.thumbnailSrc);
+  item.derivativeState = response.variants?.working?.state || "ready";
+  item.derivativeError = response.variants?.working?.errorCode || "";
+  item.src = response.rendererSrc || (response.assetId ? `app-media://asset/${response.assetId}?variant=working` : item.src);
+  item.lifecycleState = response.persistence?.ok ? "DURABLE" : "ORIGINAL_LOCAL";
+  item.captureError = response.persistence?.ok ? "" : (response.persistence?.error || "SQLite unavailable");
+  saveState.textContent = response.persistence?.ok ? "Saved" : "Saved local";
+}
+async function localizeRemoteCapture(item, url, naturalSize, candidateManifest = {}) {
+  if (!shellBridge?.localizeRemoteImage) {
+    item.lifecycleState = "REMOTE_REFERENCE";
+    item.captureError = "";
+    renderCanvas();
+    persist({ type: "capture.lifecycle", targetId: item.id, payload: { state: item.lifecycleState, src: item.src, localize: false } });
+    return;
+  }
+  item.lifecycleState = "LOCALIZING";
+  item.captureError = "";
+  renderCanvas();
+  try {
+    item.captureJobId = item.captureJobId || "remote-" + Date.now() + "-" + Math.random().toString(16).slice(2, 7);
+    const response = await shellBridge.localizeRemoteImage({
+      captureId: item.captureJobId,
+      dayCanvasId: state.activeDayId,
+      boardDate: state.activeDayId,
+      sourceType: "remote-url",
+      url,
+      pixelWidth: naturalSize.width || 0,
+      pixelHeight: naturalSize.height || 0,
+      imageObject: captureImageObjectPayload(item, naturalSize, "DURABLE"),
+      candidateManifest: { ...candidateManifest, sourceUrl: url }
+    });
+    if (!response?.ok) throw new Error(response?.error || "REMOTE_LOCALIZE_FAILED");
+    applyLocalizedCaptureResponse(item, response);
+  } catch (error) {
+    item.lifecycleState = "FAILED";
+    item.captureError = error?.message || "Remote localize failed";
+    saveState.textContent = "Kept remote reference";
+  }
+  renderCanvas();
+  persist({ type: "capture.lifecycle", targetId: item.id, payload: { state: item.lifecycleState, assetId: item.assetId || "", error: item.captureError || "", captureJobId: item.captureJobId || item.id, src: item.src } });
+}
 async function commitLocalCapture(item, dataUrl, naturalSize, sourceType, candidateManifest = {}) {
   if (!shellBridge?.commitCapturedMedia) return;
   item.lifecycleState = "LOCALIZING";
@@ -1523,18 +1579,19 @@ async function captureFile(file, sourceType, worldPoint) {
 }
 async function captureRemoteUrl(url, worldPoint) {
   saveState.textContent = "Resolving";
-  const item = createCapturedImage(url, { width: 280, height: 210 }, "browser-drag", worldPoint, { lifecycleState: "RESOLVING" });
-  try {
-    const naturalSize = await imageSizeFromSource(url);
+  const captureJobId = "remote-" + Date.now() + "-" + Math.random().toString(16).slice(2, 7);
+  const item = createCapturedImage(url, { width: 280, height: 210 }, "remote-url", worldPoint, { lifecycleState: "REMOTE_REFERENCE", captureJobId, sourceUrl: url });
+  imageSizeFromSource(url).then((naturalSize) => {
     item.width = comfortableInitialWidth(naturalSize.width, naturalSize.height);
-    item.lifecycleState = "REMOTE_REFERENCE";
-    item.captureError = "";
-  } catch (error) {
+    renderCanvas();
+    persist({ type: "capture.lifecycle", targetId: item.id, payload: { state: item.lifecycleState, src: item.src, resolved: true } });
+    localizeRemoteCapture(item, url, naturalSize, { sourceUrl: url });
+  }).catch((error) => {
     item.lifecycleState = "FAILED";
     item.captureError = error?.message || "Remote resolve failed";
-  }
-  renderCanvas();
-  persist({ type: "capture.lifecycle", targetId: item.id, payload: { state: item.lifecycleState, error: item.captureError || "", src: item.src } });
+    renderCanvas();
+    persist({ type: "capture.lifecycle", targetId: item.id, payload: { state: item.lifecycleState, error: item.captureError || "", src: item.src } });
+  });
 }
 
 async function handlePaste(event) {
@@ -1680,7 +1737,7 @@ function openTrashPopover(popover) {
 function exportSafeDayId() { return String(state.activeDayId || "day").replace(/[^0-9a-z-]/gi, "-"); }
 function exportFileStamp() { return new Date().toISOString().replace(/[:.]/g, "-"); }
 function sanitizeExportItem(item) {
-  const copy = { id: item.id, kind: item.kind || "image", x: item.x, y: item.y, width: item.width, z: item.z, locked: Boolean(item.locked), note: item.note || "", keywords: [...(item.keywords || [])], lifecycleState: item.lifecycleState || "READY", sourceType: item.sourceType || "", url: item.url || "", label: item.label || "", assetId: item.assetId || "", sha256: item.sha256 || "", originalRelpath: item.originalRelpath || "" };
+  const copy = { id: item.id, kind: item.kind || "image", x: item.x, y: item.y, width: item.width, z: item.z, locked: Boolean(item.locked), note: item.note || "", keywords: [...(item.keywords || [])], lifecycleState: item.lifecycleState || "READY", sourceType: item.sourceType || "", sourceUrl: item.sourceUrl || "", url: item.url || "", label: item.label || "", assetId: item.assetId || "", sha256: item.sha256 || "", originalRelpath: item.originalRelpath || "" };
   if (item.assetId) copy.media = { assetId: item.assetId, variants: { original: "app-media://asset/" + item.assetId + "?variant=original", working: "app-media://asset/" + item.assetId + "?variant=working", thumbnail: "app-media://asset/" + item.assetId + "?variant=thumbnail" } };
   if (item.src && !/^[a-z]:\\|^\\\\/i.test(item.src)) copy.src = item.src;
   return copy;

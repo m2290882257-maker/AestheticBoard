@@ -260,6 +260,67 @@ async function captureViewportPng(request) {
   fs.writeFileSync(filePath, buffer);
   return { ok: true, filePath, fileName: path.basename(filePath), byteLength: buffer.length };
 }
+const remoteImageMimeTypes = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+const remoteImageMaxBytes = 25 * 1024 * 1024;
+function detectRemoteImageMime(bytes) {
+  if (bytes.length > 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return 'image/png';
+  if (bytes.length > 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg';
+  if (bytes.length > 6 && bytes.slice(0, 3).toString('ascii') === 'GIF') return 'image/gif';
+  if (bytes.length > 12 && bytes.slice(0, 4).toString('ascii') === 'RIFF' && bytes.slice(8, 12).toString('ascii') === 'WEBP') return 'image/webp';
+  throw new Error('REMOTE_UNSUPPORTED_MAGIC_BYTES');
+}
+function validateRemoteImageUrl(value) {
+  let url;
+  try { url = new URL(String(value || '')); } catch { throw new Error('REMOTE_INVALID_URL'); }
+  if (!['http:', 'https:'].includes(url.protocol)) throw new Error('REMOTE_UNSUPPORTED_PROTOCOL');
+  return url.toString();
+}
+function mimeFromResponse(response) {
+  return String(response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+}
+async function fetchRemoteImageDataUrl(url) {
+  const safeUrl = validateRemoteImageUrl(url);
+  const response = await net.fetch(safeUrl, { redirect: 'follow' });
+  if (!response.ok) throw new Error('REMOTE_FETCH_' + response.status);
+  const mime = mimeFromResponse(response);
+  if (mime && !remoteImageMimeTypes.has(mime)) throw new Error('REMOTE_UNSUPPORTED_TYPE');
+  const lengthHeader = Number(response.headers.get('content-length') || 0);
+  if (lengthHeader > remoteImageMaxBytes) throw new Error('REMOTE_IMAGE_TOO_LARGE');
+  const bytes = Buffer.from(await response.arrayBuffer());
+  if (!bytes.length) throw new Error('REMOTE_EMPTY_BODY');
+  if (bytes.length > remoteImageMaxBytes) throw new Error('REMOTE_IMAGE_TOO_LARGE');
+  const detectedMime = detectRemoteImageMime(bytes);
+  if (mime && mime !== detectedMime) throw new Error('REMOTE_MIME_MAGIC_MISMATCH');
+  return { dataUrl: 'data:' + detectedMime + ';base64,' + bytes.toString('base64'), byteLength: bytes.length, mime: detectedMime, finalUrl: response.url || safeUrl };
+}
+async function localizeRemoteImage(request) {
+  const state = safeProfileState();
+  if (!state.ready) return { ok: false, error: state.error || 'PROFILE_UNAVAILABLE' };
+  try {
+    const remote = await fetchRemoteImageDataUrl(request?.url);
+    const candidateManifest = { ...(request?.candidateManifest || {}), sourceUrl: request?.url || '', finalUrl: remote.finalUrl, byteLength: remote.byteLength, mime: remote.mime };
+    const committed = commitDataUrl(profileRoot(), { ...(request || {}), sourceType: request?.sourceType || 'remote-url', dataUrl: remote.dataUrl, candidateManifest });
+    const persistence = insertDurableCapture(profileRoot(), {
+      captureJobId: request?.captureId || committed.assetId,
+      dayCanvasId: request?.dayCanvasId || request?.boardDate || 'undated',
+      boardDate: request?.boardDate || request?.dayCanvasId || 'undated',
+      sourceType: request?.sourceType || 'remote-url',
+      candidateManifest,
+      assetId: committed.assetId,
+      sha256: committed.sha256,
+      originalRelpath: committed.originalRelpath,
+      mime: committed.mime,
+      byteLength: committed.byteLength,
+      width: request?.pixelWidth || 0,
+      height: request?.pixelHeight || 0,
+      imageObject: request?.imageObject || {}
+    });
+    return { ok: true, ...committed, persistence, captureJob: committed.captureJob, finalUrl: remote.finalUrl };
+  } catch (error) {
+    if (request?.captureId) updateCaptureJob(profileRoot(), request.captureId, { state: 'FAILED', dayCanvasId: request?.dayCanvasId || request?.boardDate || 'undated', sourceType: request?.sourceType || 'remote-url', candidateManifest: { sourceUrl: request?.url || '' }, imageObject: request?.imageObject || null, lastErrorCode: error?.message || 'REMOTE_LOCALIZE_FAILED' });
+    return { ok: false, error: error?.message || 'REMOTE_LOCALIZE_FAILED' };
+  }
+}
 function sanitizeFixtureSnapshot(snapshot) {
   const clean = JSON.parse(JSON.stringify(snapshot || {}, (key, value) => {
     if (['pendingMutationIds', 'mutationError', 'pendingDataUrl'].includes(key)) return undefined;
@@ -432,6 +493,7 @@ ipcMain.handle('diagnostics:record-drag-probe', (_event, probe) => {
   fs.appendFileSync(dragHarnessLogPath(), JSON.stringify(safeProbe) + '\n', 'utf8');
   return { ok: true, recordedAtUtc: safeProbe.recordedAtUtc };
 });
+ipcMain.handle('capture:localize-remote-url', (_event, request) => localizeRemoteImage(request));
 ipcMain.handle('capture:commit-data-url', (_event, request) => {
   const state = safeProfileState();
   if (!state.ready) return { ok: false, error: state.error || 'PROFILE_UNAVAILABLE' };
