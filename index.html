@@ -23,12 +23,16 @@
       </nav>
 
       <section class="temporal-controls" aria-label="Temporal controls">
-        <div class="day-nav" role="group" aria-label="Day navigation">
-          <button class="text-button" id="prev-day" type="button">Previous</button>
-          <button class="text-button today" id="today" type="button">Today</button>
-          <button class="text-button" id="next-day" type="button">Next</button>
+        <div class="day-nav" role="group" aria-label="Date navigation">
+          <button class="nav-arrow prev-arrow" id="prev-day" type="button" aria-label="Previous"><span aria-hidden="true"></span></button>
+          <button class="today-pill" id="today" type="button">TODAY</button>
+          <button class="nav-arrow next-arrow" id="next-day" type="button" aria-label="Next"><span aria-hidden="true"></span></button>
         </div>
-        <button id="mode-selector" class="mode-selector" type="button" aria-haspopup="true" aria-expanded="false"><span>Day Mode</span><span aria-hidden="true">⌄</span></button>
+        <div id="mode-selector" class="mode-selector view-mode-selector" role="group" aria-label="View mode selector">
+          <button class="view-mode-option" type="button" data-mode="day">Day Canvas</button>
+          <button class="view-mode-option" type="button" data-mode="weekly">Weekly</button>
+          <button class="view-mode-option" type="button" data-mode="monthly">Monthly</button>
+        </div>
       </section>
 
       <div id="popover-layer" class="popover-layer" aria-live="polite"></div>

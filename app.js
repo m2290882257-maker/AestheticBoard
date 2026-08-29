@@ -10,6 +10,8 @@ const DENSE_ITEM_THRESHOLD = 24;
 const ZOOMED_OUT_THRESHOLD = 0.62;
 const DRAG_HARNESS_LIMIT = 30;
 const TEXT_PREVIEW_LIMIT = 140;
+const AI_KEYWORD_MAX = 8;
+const AI_KEYWORD_HISTORY_MAX = 32;
 const copyIcon = "refer/icon/copy (1).svg";
 
 const surfaces = {
@@ -48,16 +50,18 @@ const zoomPercent = document.querySelector("#zoom-percent");
 const trashButton = document.querySelector('[data-popover="trash"]');
 const shellBridge = window.aestheticBoardShell || null;
 let shellState = { alwaysOnTop: false };
-let profileState = { ready: false, profileLabel: "Browser preview", directories: [] };
+let profileState = { ready: false, profileLabel: "Browser preview", directories: [], keywordProvider: { activeProvider: "local-mock", externalProviderEnabled: false, modeLabel: "Local mock only", permissions: { imageAccess: false, textAccess: true, network: false }, consentVersion: "provider-consent-v1" } };
 
 const state = loadState();
 let dragIntent = null;
 let saveTimer = 0;
 let latestPersistenceRequest = 0;
 let lastAckRevision = Number(state.persistenceRevision || 0);
-let searchState = { open: false, query: "", results: [], selectedIndex: 0 };
+let searchState = { open: false, query: "", results: [], selectedIndex: 0, source: "renderer" };
+let durableSearchRequest = 0;
 let retrySequence = Number(state.retrySequence || 0);
 let conflictState = { active: false, message: "" };
+let mediaRelinkBatchState = null;
 
 function startOfDay(date) { return new Date(date.getFullYear(), date.getMonth(), date.getDate()); }
 function padDatePart(value) { return String(value).padStart(2, "0"); }
@@ -66,11 +70,29 @@ function dateKeyFromDate(date) {
   return `${localDate.getFullYear()}-${padDatePart(localDate.getMonth() + 1)}-${padDatePart(localDate.getDate())}`;
 }
 function activeDate() {
-  const [year, month, date] = state.activeDayId.split("-").map(Number);
-  return new Date(year, month - 1, date);
+  return dateFromDayId(state.activeDayId);
 }
 function clamp(value, min, max) { return Math.min(max, Math.max(min, value)); }
-function cloneItems(items) { return items.map((item) => ({ ...item, keywords: [...(item.keywords || [])] })); }
+function cloneKeywordCandidates(candidates) {
+  return (Array.isArray(candidates) ? candidates : []).map((candidate, index) => {
+    const state = String(candidate.state || "suggested");
+    const createdAtUtc = String(candidate.createdAtUtc || candidate.generatedAtUtc || new Date().toISOString());
+    return {
+      id: String(candidate.id || "candidate-" + index),
+      text: String(candidate.text || "").trim(),
+      confidence: Number(candidate.confidence || 0),
+      source: String(candidate.source || candidate.provider || "local-mock"),
+      provider: String(candidate.provider || candidate.source || "local-mock"),
+      state,
+      createdAtUtc,
+      reviewedAtUtc: String(candidate.reviewedAtUtc || ""),
+      acceptedAtUtc: String(candidate.acceptedAtUtc || ""),
+      dismissedAtUtc: String(candidate.dismissedAtUtc || ""),
+      pinnedAtUtc: String(candidate.pinnedAtUtc || "")
+    };
+  }).filter((candidate) => candidate.text).slice(0, AI_KEYWORD_HISTORY_MAX);
+}
+function cloneItems(items) { return items.map((item) => ({ ...item, keywords: [...(item.keywords || [])], keywordCandidates: cloneKeywordCandidates(item.keywordCandidates) })); }
 
 function createDay(seedItems = []) {
   return { title: "", camera: { ...DEFAULT_CAMERA }, pasteSequence: 0, items: cloneItems(seedItems), trash: [] };
@@ -78,7 +100,7 @@ function createDay(seedItems = []) {
 
 function loadState() {
   const todayId = dateKeyFromDate(new Date());
-  const fallback = { activeDayId: todayId, surface: "quiet", days: { [todayId]: createDay(initialItems) }, selectedId: "img-01", activeKeywordId: null, expandedNoteId: null, dragHarness: [] };
+  const fallback = { activeDayId: todayId, viewMode: "day", surface: "quiet", days: { [todayId]: createDay(initialItems) }, selectedId: "img-01", activeKeywordId: null, expandedNoteId: null, dragHarness: [] };
   try {
     const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
     if (saved.days) return normalizeState({ ...fallback, ...saved });
@@ -110,8 +132,20 @@ function normalizeState(value) {
     day.camera = { ...DEFAULT_CAMERA, ...(day.camera || {}) };
     day.pasteSequence ||= 0;
     day.items = Array.isArray(day.items) ? day.items : [];
+    day.items.forEach((item) => {
+      item.keywords = Array.isArray(item.keywords) ? item.keywords : [];
+      item.keywordCandidates = cloneKeywordCandidates(item.keywordCandidates);
+      item.aiKeywordState ||= item.keywordCandidates.some((candidate) => candidate.state === "suggested") ? "suggested" : "idle";
+      item.aiKeywordProvider ||= "local-mock";
+    });
     day.trash = Array.isArray(day.trash) ? day.trash : [];
+    day.trash.forEach((entry) => {
+      if (!entry.item) return;
+      entry.item.keywords = Array.isArray(entry.item.keywords) ? entry.item.keywords : [];
+      entry.item.keywordCandidates = cloneKeywordCandidates(entry.item.keywordCandidates);
+    });
   });
+  value.viewMode = ["day", "weekly", "monthly"].includes(value.viewMode) ? value.viewMode : "day";
   value.selectedId ??= null;
   value.activeKeywordId ??= null;
   value.expandedNoteId ??= null;
@@ -139,6 +173,9 @@ function objectMutationPayload(item) {
     locked: Boolean(item.locked),
     note: item.note || "",
     keywords: [...(item.keywords || [])],
+    keywordCandidates: cloneKeywordCandidates(item.keywordCandidates),
+    aiKeywordState: item.aiKeywordState || "idle",
+    aiKeywordProvider: item.aiKeywordProvider || "local-mock",
     lifecycleState: item.lifecycleState || "READY",
     assetId: item.assetId || "",
     sourceUrl: item.sourceUrl || "",
@@ -146,7 +183,11 @@ function objectMutationPayload(item) {
     src: item.src || "",
     originalSrc: item.originalSrc || "",
     thumbnailSrc: item.thumbnailSrc || "",
-    derivativeState: item.derivativeState || ""
+    derivativeState: item.derivativeState || "",
+    mediaResolution: item.mediaResolution || "",
+    importedFromId: item.importedFromId || "",
+    importBatchId: item.importBatchId || "",
+    mediaRepairState: item.mediaRepairState || ""
   };
 }
 
@@ -166,7 +207,7 @@ function applyCaptureRecovery(recovery) {
     if (!item && job.state === "DURABLE" && job.imageObject) {
       const board = state.days[job.dayCanvasId] || createDay();
       state.days[job.dayCanvasId] = board;
-      item = { ...job.imageObject, id: job.imageObject.id || job.id, captureJobId: job.id, kind: job.imageObject.kind || "image", src: job.rendererSrc || job.imageObject.src || "", keywords: [...(job.imageObject.keywords || ["recovered capture"])] };
+      item = { ...job.imageObject, id: job.imageObject.id || job.id, captureJobId: job.id, kind: job.imageObject.kind || "image", src: job.rendererSrc || job.imageObject.src || "", keywords: [...(job.imageObject.keywords || ["recovered capture"])], keywordCandidates: cloneKeywordCandidates(job.imageObject.keywordCandidates) };
       if (!board.items.some((candidate) => candidate.id === item.id || candidate.captureJobId === job.id)) board.items.push(item);
     }
     if (!item) return;
@@ -272,8 +313,38 @@ function keepOptimisticObject(targetId) {
   clearFailedMutationMarks(ids);
   const item = findItemAcrossDays(targetId);
   if (item) item.mutationError = "";
+  persistRetryQueueMetadata();
   saveState.textContent = retryQueueCount() ? "Needs retry" : "Saved";
   renderCanvas();
+}
+
+function restoreRetryMetadata(metadata) {
+  if (!metadata?.queue) return;
+  state.retryQueue = Array.isArray(metadata.queue) ? metadata.queue : [];
+  retrySequence = Math.max(Number(metadata.retrySequence || 0), ...state.retryQueue.map((entry) => Number(entry.order || 0)), 0);
+  state.retrySequence = retrySequence;
+  state.retryQueue.forEach((entry) => {
+    if (!entry.targetId && entry.mutation?.targetId) entry.targetId = entry.mutation.targetId;
+    if (!entry.dayCanvasId && entry.mutation?.dayCanvasId) entry.dayCanvasId = entry.mutation.dayCanvasId;
+    if (!entry.targetId) return;
+    const item = findItemAcrossDays(entry.targetId);
+    if (!item) return;
+    item.failedMutationIds = [...new Set([...(item.failedMutationIds || []), entry.id || entry.mutation?.id])].filter(Boolean);
+    item.mutationError = entry.error || item.mutationError || "Persistence ACK failed";
+  });
+  if (retryQueueCount()) {
+    saveState.textContent = "Needs retry";
+    saveState.title = retryQueueCount() + " failed save mutations restored";
+  }
+}
+
+function persistRetryQueueMetadata() {
+  state.retrySequence = retrySequence;
+  if (!shellBridge?.writeRetryQueue) {
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshotForPersistence())); } catch {}
+    return;
+  }
+  shellBridge.writeRetryQueue({ queue: retryQueue(), retrySequence }).catch(() => {});
 }
 
 function markMutationsPending(mutations) {
@@ -314,6 +385,7 @@ function persist(input = {}) {
       settleMutations(mutationIds);
       removeRetryEntries(mutationIds);
       clearFailedMutationMarks(mutationIds);
+      persistRetryQueueMetadata();
       updateConflictIndicator(null);
       if (requestId === latestPersistenceRequest) saveState.textContent = retryQueueCount() ? "Needs retry" : "Saved";
       refreshOpenSearch();
@@ -329,6 +401,7 @@ function persist(input = {}) {
       settleMutations(ackedIds);
       removeRetryEntries(ackedIds);
       clearFailedMutationMarks(ackedIds);
+      persistRetryQueueMetadata();
       saveState.title = "";
       updateConflictIndicator(ack);
       if (requestId === latestPersistenceRequest) saveState.textContent = conflictState.active ? "Saved conflict" : retryQueueCount() ? "Needs retry" : "Saved";
@@ -339,6 +412,7 @@ function persist(input = {}) {
       const message = error?.message || "Persistence ACK failed";
       settleMutations(ids, message);
       queueFailedMutations(request.mutations, message);
+      persistRetryQueueMetadata();
       if (requestId === latestPersistenceRequest) {
         saveState.textContent = "Needs retry";
         saveState.title = message + (retryQueueCount() ? ` - ${retryQueueCount()} queued` : "");
@@ -349,11 +423,21 @@ function persist(input = {}) {
 }
 
 function formatMainDate(date) { return new Intl.DateTimeFormat("en", { month: "long", day: "numeric", weekday: "long" }).format(date); }
-function formatSecondaryDate(date) { return new Intl.DateTimeFormat("en", { year: "numeric", month: "long", day: "numeric" }).format(date); }
+function formatSecondaryDate(date) { return new Intl.DateTimeFormat("en", { weekday: "long", year: "numeric", month: "long", day: "numeric" }).format(date); }
+function formatMonthDate(date) { return `${new Intl.DateTimeFormat("en", { month: "long" }).format(date)}, ${date.getFullYear()}`; }
+function formatMonthCaps(date) { return formatMonthDate(date).toUpperCase(); }
+function shortMonthDay(date) { return new Intl.DateTimeFormat("en", { month: "short", day: "numeric" }).format(date); }
+function weekStartForDate(date) { const started = startOfDay(date); const offset = (started.getDay() + 6) % 7; return new Date(started.getTime() - offset * ONE_DAY); }
+function weekDaysForDate(date) { const start = weekStartForDate(date); return Array.from({ length: 7 }, (_, index) => new Date(start.getTime() + index * ONE_DAY)); }
+function formatWeekDate(date) { const days = weekDaysForDate(date); const start = days[0]; const end = days[6]; return `Week of ${shortMonthDay(start)} -${shortMonthDay(end)} , ${end.getFullYear()}`; }
+function isOverviewMode() { return state.viewMode === "weekly" || state.viewMode === "monthly"; }
 function screenToWorld(clientX, clientY) { const cam = camera(); return { x: (clientX - cam.x) / cam.zoom, y: (clientY - cam.y) / cam.zoom }; }
 function dateFromDayId(dayId) {
-  const parts = String(dayId || state.activeDayId).split("-").map(Number);
-  return new Date(parts[0] || new Date().getFullYear(), (parts[1] || 1) - 1, parts[2] || 1);
+  const fallback = startOfDay(new Date());
+  const match = String(dayId || state.activeDayId || "").match(/(\d{4})-(\d{2})-(\d{2})/);
+  if (!match) return fallback;
+  const date = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+  return Number.isNaN(date.getTime()) ? fallback : date;
 }
 function normalizeSearchText(value) { return String(value || "").toLowerCase().replace(/\s+/g, " ").trim(); }
 function hostFromUrl(value) { try { return new URL(String(value || "")).host; } catch { return ""; } }
@@ -373,12 +457,35 @@ function buildSearchIndex() {
   });
   return entries;
 }
-function runSearch(query) {
-  searchState.query = query;
+function mapDurableSearchResult(result) {
+  const item = result.type === "day" ? null : findItemAcrossDays(result.id);
+  return { ...result, item, haystack: "" };
+}
+function runLocalSearch(query) {
   const q = normalizeSearchText(query);
   searchState.results = q ? buildSearchIndex().filter((entry) => entry.haystack.includes(q)).slice(0, 80) : [];
+  searchState.source = "renderer";
   searchState.selectedIndex = clamp(searchState.selectedIndex, 0, Math.max(searchState.results.length - 1, 0));
   return searchState.results;
+}
+function runSearch(query) {
+  searchState.query = query;
+  const results = runLocalSearch(query);
+  const q = normalizeSearchText(query);
+  if (q && shellBridge?.searchBoard) {
+    const requestId = ++durableSearchRequest;
+    shellBridge.searchBoard({ query, limit: 80 }).then((response) => {
+      if (requestId !== durableSearchRequest || normalizeSearchText(searchState.query) !== q) return;
+      if (!response?.ok || !Array.isArray(response.results)) return;
+      searchState.results = response.results.map(mapDurableSearchResult);
+      searchState.source = response.source || "metadata.sqlite";
+      searchState.selectedIndex = clamp(searchState.selectedIndex, 0, Math.max(searchState.results.length - 1, 0));
+      const popover = popoverLayer.querySelector(".search-popover");
+      if (popover) renderSearchResults(popover);
+      renderCanvas();
+    }).catch(() => {});
+  }
+  return results;
 }
 function decorateSearchState(object, item) {
   const active = Boolean(normalizeSearchText(searchState.query));
@@ -685,7 +792,8 @@ async function initializeShellBridge() {
     const recovered = await shellBridge.loadWorkspaceSnapshot?.();
     if (recovered?.ok && applyRecoveredSnapshot(recovered.snapshot)) {
       applyCaptureRecovery(recovered.captureRecovery || profileState.captureRecovery);
-      saveState.textContent = "Recovered";
+      restoreRetryMetadata(recovered.retryMetadata);
+      saveState.textContent = retryQueueCount() ? "Needs retry" : "Recovered";
     }
   } catch {
     // A missing or failed snapshot keeps the immediate renderer fallback state.
@@ -714,8 +822,42 @@ function makePopoverButton(label, value, handler, disabled = false) {
   const detail = document.createElement("span");
   detail.textContent = value;
   button.append(name, detail);
-  if (handler) button.addEventListener("click", handler);
+  button.addEventListener("pointerdown", (event) => event.stopPropagation());
+  if (handler) button.addEventListener("click", (event) => { event.preventDefault(); event.stopPropagation(); handler(event); });
   return button;
+}
+
+
+function createDetailRows(details) {
+  const rows = document.createElement("div");
+  rows.className = "profile-detail-list";
+  details.forEach(([label, value]) => {
+    const row = document.createElement("div");
+    row.className = "profile-detail-row";
+    const name = document.createElement("span");
+    name.textContent = label;
+    const detail = document.createElement("strong");
+    detail.textContent = value;
+    row.append(name, detail);
+    rows.appendChild(row);
+  });
+  return rows;
+}
+
+function createSettingsSection(titleText, children, copyText = "") {
+  const section = document.createElement("section");
+  section.className = "settings-section";
+  const title = document.createElement("h3");
+  title.textContent = titleText;
+  section.appendChild(title);
+  if (copyText) {
+    const copy = document.createElement("p");
+    copy.className = "settings-section-copy";
+    copy.textContent = copyText;
+    section.appendChild(copy);
+  }
+  children.filter(Boolean).forEach((child) => section.appendChild(child));
+  return section;
 }
 
 function openDragHarnessPopover(popover) {
@@ -762,6 +904,9 @@ function openProfilePopover(popover) {
     ["Metadata", profileState.metadata?.ready ? "SQLite ready" : profileState.ready ? "File fallback" : "Unavailable"],
     ["Recovery", profileState.captureRecovery?.failed?.length ? `${profileState.captureRecovery.failed.length} failed jobs` : "No pending jobs"],
     ["Restore check", profileState.restoreVerification ? `${profileState.restoreVerification.days} days / ${profileState.restoreVerification.objects} objects` : "Not run"],
+    ["Retry queue", retryQueueCount() ? `${retryQueueCount()} pending` : profileState.restoreVerification?.retryQueue ? `${profileState.restoreVerification.retryQueue} stored` : "Empty"],
+    ["Remote fetch", profileState.remotePolicy || "HTTP/HTTPS images only"],
+    ["AI keywords", profileState.keywordProvider?.modeLabel || "Local mock only"],
     ["Privacy", "Local profile only"]
   ];
   details.forEach(([label, value]) => {
@@ -778,11 +923,11 @@ function openProfilePopover(popover) {
   repair.type = "button";
   repair.textContent = "Repair media index";
   repair.disabled = !shellBridge?.repairMediaIndex;
-  repair.addEventListener("click", repairMediaIndexFromMenu);
+  repair.addEventListener("click", () => repairMediaIndexFromMenu(popover));
   popover.append(title, rows, repair);
 }
 
-async function repairMediaIndexFromMenu() {
+async function repairMediaIndexFromMenu(popover = null) {
   if (!shellBridge?.repairMediaIndex) return;
   saveState.textContent = "Repairing media";
   try {
@@ -790,7 +935,8 @@ async function repairMediaIndexFromMenu() {
     if (!result?.ok) throw new Error(result?.error || "Repair failed");
     profileState.mediaRepair = result;
     saveState.textContent = `Media repaired: ${result.originals} originals`;
-    openActionPopover(document.querySelector('[data-popover="more"]'));
+    if (popover) openDataPrivacyPopover(popover);
+    else openActionPopover(document.querySelector('[data-popover="more"]'));
   } catch (error) {
     saveState.textContent = "Repair failed";
     saveState.title = error?.message || "Media repair failed";
@@ -806,8 +952,20 @@ async function exportRestoreFixtureFromMenu(popover) {
     if (!result?.ok) throw new Error(result?.error || "Fixture export failed");
     saveState.textContent = "Fixture exported";
     saveState.title = result.filePath || result.fileName || "";
-    openMorePopover(popover);
+    openDataPrivacyPopover(popover);
   } catch (error) { saveState.textContent = "Fixture failed"; saveState.title = error?.message || "Fixture export failed"; }
+}
+async function exportProfileBackupFromMenu(popover) {
+  if (!shellBridge?.exportProfileBackup) return;
+  saveState.textContent = "Exporting backup";
+  try {
+    const result = await shellBridge.exportProfileBackup({ snapshot: snapshotForPersistence() });
+    if (result?.canceled) { saveState.textContent = "Backup canceled"; return; }
+    if (!result?.ok) throw new Error(result?.error || "Backup export failed");
+    saveState.textContent = "Backup exported";
+    saveState.title = result.filePath || result.fileName || "";
+    openDataPrivacyPopover(popover);
+  } catch (error) { saveState.textContent = "Backup failed"; saveState.title = error?.message || "Backup export failed"; }
 }
 async function verifyRestoreProfileFromMenu(popover) {
   if (!shellBridge?.verifyRestoreProfile) return;
@@ -817,10 +975,266 @@ async function verifyRestoreProfileFromMenu(popover) {
     if (!result?.ok) throw new Error(result?.error || "Verify failed");
     profileState.restoreVerification = result;
     saveState.textContent = `Verified ${result.days} days / ${result.objects} objects`;
-    saveState.title = `trash ${result.trash}, media ${result.mediaAssets}, capture jobs ${result.captureJobs}, failed ${result.failedCaptureJobs}`;
-    openProfilePopover(popover);
+    saveState.title = `trash ${result.trash}, media ${result.mediaAssets}, capture jobs ${result.captureJobs}, failed ${result.failedCaptureJobs}, retry ${result.retryQueue || 0}`;
+    openDataPrivacyPopover(popover);
   } catch (error) { saveState.textContent = "Verify failed"; saveState.title = error?.message || "Verify failed"; }
 }
+function missingMediaRefsForCurrentDay() {
+  return items().filter(isMissingImportedMedia).filter((item) => item.sha256).map((item) => ({
+    objectId: item.id,
+    importedFromId: item.importedFromId || "",
+    sha256: item.sha256,
+    dayCanvasId: state.activeDayId,
+    imageObject: objectMutationPayload(item)
+  }));
+}
+
+function createMediaRelinkBatchSummary() {
+  const summary = document.createElement("section");
+  summary.className = "media-relink-summary";
+  const missing = items().filter(isMissingImportedMedia);
+  const title = document.createElement("h3");
+  title.textContent = "Missing media repair";
+  const copy = document.createElement("p");
+  copy.textContent = missing.length ? String(missing.length) + " missing on this day. Folder scan matches by SHA-256 before anything is changed." : "No missing imported media on this day.";
+  summary.append(title, copy);
+  if (mediaRelinkBatchState) {
+    const detail = document.createElement("div");
+    detail.className = "media-relink-grid";
+    [["Scanned", mediaRelinkBatchState.scanned], ["Matched", mediaRelinkBatchState.matched], ["Unmatched", mediaRelinkBatchState.unmatched], ["Folder", mediaRelinkBatchState.folderName || "Chosen folder"]].forEach(([label, value]) => {
+      const cell = document.createElement("div");
+      const small = document.createElement("span"); small.textContent = label;
+      const strong = document.createElement("strong"); strong.textContent = String(value ?? 0);
+      cell.append(small, strong);
+      detail.appendChild(cell);
+    });
+    summary.appendChild(detail);
+  }
+  return summary;
+}
+
+async function previewMediaRelinkBatchFromMenu(popover) {
+  if (!shellBridge?.previewMediaRelinkBatch) return;
+  const refs = missingMediaRefsForCurrentDay();
+  if (!refs.length) { saveState.textContent = "No missing media"; openDataPrivacyPopover(popover); return; }
+  saveState.textContent = "Choose media folder";
+  try {
+    const result = await shellBridge.previewMediaRelinkBatch({ refs });
+    if (result?.canceled) { saveState.textContent = "Folder scan canceled"; return; }
+    if (!result?.ok) throw new Error(result?.error || "Media scan failed");
+    mediaRelinkBatchState = result;
+    saveState.textContent = "Matched " + result.matched + " / " + result.needed;
+    openDataPrivacyPopover(popover);
+  } catch (error) {
+    saveState.textContent = "Media scan failed";
+    saveState.title = error?.message || "Media scan failed";
+  }
+}
+
+async function applyMediaRelinkBatchFromMenu(popover) {
+  if (!shellBridge?.applyMediaRelinkBatch || !mediaRelinkBatchState?.previewId) return;
+  saveState.textContent = "Applying media repairs";
+  try {
+    const result = await shellBridge.applyMediaRelinkBatch({ previewId: mediaRelinkBatchState.previewId });
+    if (!result?.ok) throw new Error(result?.error || "Batch repair failed");
+    const byId = new Map((result.repairs || []).map((repair) => [repair.objectId, repair]));
+    const mutations = [];
+    items().forEach((item) => {
+      const repair = byId.get(item.id);
+      if (!repair) return;
+      item.assetId = repair.assetId;
+      item.sha256 = repair.sha256;
+      item.originalRelpath = repair.originalRelpath;
+      item.byteLength = repair.byteLength || item.byteLength || 0;
+      item.originalSrc = repair.originalRendererSrc || (repair.assetId ? "app-media://asset/" + repair.assetId + "?variant=original" : item.originalSrc);
+      item.thumbnailSrc = repair.thumbnailSrc || (repair.assetId ? "app-media://asset/" + repair.assetId + "?variant=thumbnail" : item.thumbnailSrc);
+      item.src = repair.rendererSrc || (repair.assetId ? "app-media://asset/" + repair.assetId + "?variant=working" : item.src);
+      item.lifecycleState = "DURABLE";
+      item.mediaResolution = "batch-relinked-local";
+      item.mediaRepairState = "relinked";
+      item.captureError = "";
+      mutations.push(makeMutation("media.relink", { assetId: item.assetId, sha256: item.sha256, originalRelpath: item.originalRelpath, mediaResolution: item.mediaResolution, src: item.src, batch: true }, item.id));
+    });
+    mediaRelinkBatchState = null;
+    renderCanvas();
+    if (mutations.length) persist({ immediate: true, mutations });
+    saveState.textContent = "Repaired " + result.repaired + " media";
+    openDataPrivacyPopover(popover);
+  } catch (error) {
+    saveState.textContent = "Batch repair failed";
+    saveState.title = error?.message || "Batch repair failed";
+  }
+}
+
+function createPrivacyCopy() {
+  const copy = document.createElement("p");
+  copy.className = "privacy-copy";
+  copy.textContent = "Backup includes days, board objects, trash, media references, capture jobs, retry metadata, and rebuildable search metadata. Restore preview is read-only; import-as-new-day adds a separate day and never overwrites your current boards. AI keywords currently use local mock only; external providers require explicit opt-in later.";
+  return copy;
+}
+function createProviderCapabilityList() {
+  const providers = profileState.keywordProvider?.providers || [];
+  const list = document.createElement("div");
+  list.className = "provider-capability-list";
+  providers.forEach((provider) => {
+    const row = document.createElement("div");
+    row.className = "provider-capability-row";
+    const name = document.createElement("strong");
+    name.textContent = provider.label || provider.id;
+    const detail = document.createElement("span");
+    const facts = [provider.external ? "external" : "local", provider.canReadImage ? "reads image" : "no image access", provider.canReadText ? "reads text" : "no text access", provider.requiresNetwork ? "network" : "offline"];
+    detail.textContent = facts.join(" / ") + (provider.enabled ? "" : " / disabled");
+    row.title = provider.description || "";
+    row.append(name, detail);
+    list.appendChild(row);
+  });
+  return list;
+}
+
+function openDataPrivacyPopover(popover) {
+  popover.className = "popover profile-popover privacy-popover";
+  popover.innerHTML = "";
+  const title = document.createElement("h2");
+  title.textContent = "Data & Privacy";
+
+  const profileReady = profileState.metadata?.ready ? "SQLite ready" : profileState.ready ? "Files ready" : "Browser preview";
+  const localRows = createDetailRows([
+    ["Profile", profileReady],
+    ["Storage", profileState.profileLabel || "Browser preview"],
+    ["Recovery", profileState.captureRecovery?.failed?.length ? `${profileState.captureRecovery.failed.length} failed jobs` : "No pending jobs"],
+    ["Retry queue", retryQueueCount() ? `${retryQueueCount()} pending` : "Empty"]
+  ]);
+  const verify = makePopoverButton("Verify data", shellBridge?.verifyRestoreProfile ? "Read only" : "Desktop only", () => verifyRestoreProfileFromMenu(popover), !shellBridge?.verifyRestoreProfile);
+
+  const backup = makePopoverButton("Export profile backup", shellBridge?.exportProfileBackup ? "Save As" : "Desktop only", () => exportProfileBackupFromMenu(popover), !shellBridge?.exportProfileBackup);
+  const preview = makePopoverButton("Preview restore JSON", shellBridge?.previewImportJson ? "Read only" : "Desktop only", () => previewImportFromMenu(popover), !shellBridge?.previewImportJson);
+  const importNewDay = makePopoverButton("Import as new day", shellBridge?.importJsonAsNewDay ? "Safe add" : "Desktop only", () => importJsonAsNewDayFromMenu(popover), !shellBridge?.importJsonAsNewDay);
+
+  const repairSummary = createMediaRelinkBatchSummary();
+  const scanMedia = makePopoverButton("Scan media folder", shellBridge?.previewMediaRelinkBatch ? "SHA match" : "Desktop only", () => previewMediaRelinkBatchFromMenu(popover), !shellBridge?.previewMediaRelinkBatch || !missingMediaRefsForCurrentDay().length);
+  const applyMedia = makePopoverButton("Apply matched media", mediaRelinkBatchState?.matched ? String(mediaRelinkBatchState.matched) + " ready" : "Preview first", () => applyMediaRelinkBatchFromMenu(popover), !mediaRelinkBatchState?.matched);
+  const repairIndex = makePopoverButton("Repair media index", shellBridge?.repairMediaIndex ? "Rebuild records" : "Desktop only", () => repairMediaIndexFromMenu(popover), !shellBridge?.repairMediaIndex);
+
+  const providerPermissions = profileState.keywordProvider?.permissions || {};
+  const providerRows = createDetailRows([
+    ["Keyword provider", profileState.keywordProvider?.modeLabel || "Local mock only"],
+    ["Consent", profileState.keywordProvider?.consentVersion || "provider-consent-v1"],
+    ["Image access", providerPermissions.imageAccess ? "Allowed" : "Off"],
+    ["Text access", providerPermissions.textAccess ? "Object text only" : "Off"],
+    ["Network", providerPermissions.network ? "Allowed" : "Off"],
+    ["External AI", profileState.keywordProvider?.externalProviderEnabled ? "Enabled" : "Off by default"],
+    ["Privacy", "Absolute paths omitted"]
+  ]);
+  const providerList = createProviderCapabilityList();
+  const aiProvider = makePopoverButton("External AI provider", "Disabled until explicit consent", null, true);
+
+  const rebuildSearch = makePopoverButton("Rebuild search", shellBridge?.rebuildSearchIndex ? "Local index" : "Desktop only", () => rebuildSearchIndexFromMenu(popover), !shellBridge?.rebuildSearchIndex);
+  const fixture = makePopoverButton("Developer fixture", shellBridge?.exportRestoreFixture ? "Export" : "Desktop only", () => exportRestoreFixtureFromMenu(popover), !shellBridge?.exportRestoreFixture);
+
+  const localSection = createSettingsSection("Local Data", [localRows, verify], "Your board is stored locally in this device profile.");
+  const backupSection = createSettingsSection("Backup / Restore", [backup, preview, importNewDay], "Backups omit absolute paths. Restore preview is read-only; import adds a separate day.");
+  const mediaSection = createSettingsSection("Media Repair", [repairSummary, scanMedia, applyMedia, repairIndex]);
+  const aiSection = createSettingsSection("AI Privacy", [providerRows, providerList, aiProvider], "Keyword suggestions use a provider router. This build only runs local mock; external providers cannot be enabled yet.");
+  const maintenanceSection = createSettingsSection("Maintenance", [rebuildSearch, fixture], "Developer-safe tools for rebuilding local read models and recovery fixtures.");
+  const status = document.createElement("div");
+  status.className = "export-status";
+  status.textContent = "Data actions stay local unless you choose a file.";
+  popover.append(title, localSection, backupSection, mediaSection, aiSection, maintenanceSection, status);
+}
+async function rebuildSearchIndexFromMenu(popover) {
+  if (!shellBridge?.rebuildSearchIndex) return;
+  saveState.textContent = "Indexing search";
+  try {
+    const result = await shellBridge.rebuildSearchIndex();
+    if (!result?.ok) throw new Error(result?.error || "Search index rebuild failed");
+    saveState.textContent = "Search indexed";
+    saveState.title = (result.indexed || 0) + " search rows";
+    openDataPrivacyPopover(popover);
+  } catch (error) {
+    saveState.textContent = "Index failed";
+    saveState.title = error?.message || "Search index rebuild failed";
+  }
+}
+
+function clearImportPreview(popover) { popover.querySelector(".import-preview-detail")?.remove(); }
+function renderImportPreviewDetail(popover, result, mode = "preview") {
+  clearImportPreview(popover);
+  const detail = document.createElement("section");
+  detail.className = "import-preview-detail";
+  const heading = document.createElement("h3");
+  heading.textContent = mode === "imported" ? "Imported as New Day" : "Import Preview";
+  const copy = document.createElement("p");
+  copy.textContent = mode === "imported" ? "A separate day was added. Existing boards were not overwritten." : "Read-only preview. Import as new day will add a separate day and will not overwrite existing boards.";
+  const grid = document.createElement("div");
+  grid.className = "import-preview-grid";
+  const media = result.mediaResolution || {};
+  const rows = [
+    ["Title", result.title || result.dayId || "Imported day"],
+    ["Objects", String(result.items || 0)],
+    ["Trash", String(result.trash || 0)],
+    ["Media matched", String(media.matched || 0)],
+    ["Media missing", String(media.missing || 0)],
+    ["Unsupported", String(media.unsupported || 0)]
+  ];
+  rows.forEach(([label, value]) => {
+    const row = document.createElement("div");
+    const name = document.createElement("span");
+    name.textContent = label;
+    const strong = document.createElement("strong");
+    strong.textContent = value;
+    row.append(name, strong);
+    grid.appendChild(row);
+  });
+  if (result.unsupportedFields?.length) {
+    const unsupported = document.createElement("p");
+    unsupported.className = "import-preview-warning";
+    unsupported.textContent = "Ignored fields: " + result.unsupportedFields.join(", ");
+    detail.append(heading, copy, grid, unsupported);
+  } else {
+    detail.append(heading, copy, grid);
+  }
+  const status = popover.querySelector(".export-status");
+  if (status) popover.insertBefore(detail, status); else popover.appendChild(detail);
+}
+async function previewImportFromMenu(popover) {
+  if (!shellBridge?.previewImportJson) return;
+  clearImportPreview(popover);
+  setExportStatus(popover, "Choose a JSON file to preview");
+  try {
+    const result = await shellBridge.previewImportJson();
+    if (result?.canceled) { setExportStatus(popover, "Import preview canceled"); return; }
+    if (!result?.ok) throw new Error(result?.error || "Import preview failed");
+    renderImportPreviewDetail(popover, result, "preview");
+    setExportStatus(popover, "Preview ready - no board state changed");
+  } catch (error) {
+    setExportStatus(popover, error?.message || "Import preview failed", true);
+  }
+}
+
+async function importJsonAsNewDayFromMenu(popover) {
+  if (!shellBridge?.importJsonAsNewDay) return;
+  clearImportPreview(popover);
+  setExportStatus(popover, "Choose a JSON file to import as a new day");
+  try {
+    const result = await shellBridge.importJsonAsNewDay();
+    if (result?.canceled) { setExportStatus(popover, "Import canceled"); return; }
+    if (!result?.ok) throw new Error(result?.error || "Import failed");
+    const recovered = await shellBridge.loadWorkspaceSnapshot?.();
+    if (recovered?.ok && applyRecoveredSnapshot(recovered.snapshot)) {
+      restoreRetryMetadata(recovered.retryMetadata);
+      renderChrome();
+      renderCanvas();
+    }
+    renderImportPreviewDetail(popover, result, "imported");
+    const media = result.mediaResolution ? " / media matched " + result.mediaResolution.matched + ", missing " + result.mediaResolution.missing : "";
+    setExportStatus(popover, "Imported " + result.items + " objects as " + result.dayId + media);
+    saveState.textContent = "Imported";
+  } catch (error) {
+    setExportStatus(popover, error?.message || "Import failed", true);
+    saveState.textContent = "Import failed";
+  }
+}
+
 function openMorePopover(popover) {
   popover.innerHTML = "";
   const title = document.createElement("h2");
@@ -828,18 +1242,13 @@ function openMorePopover(popover) {
   const status = shellBridge ? (shellState.alwaysOnTop ? "On" : "Off") : "Electron only";
   const always = makePopoverButton("Always-on-top", status, toggleAlwaysOnTop, !shellBridge);
   always.dataset.action = "always-on-top";
-  const profileDetail = profileState.metadata?.ready ? "SQLite ready" : profileState.ready ? "Files ready" : "Browser only";
-  const profile = makePopoverButton("Local profile", profileDetail, () => openProfilePopover(popover), !shellBridge);
-  profile.className = "profile-status-row";
-  profile.title = profileState.profileLabel || "Profile unavailable";
   const dragHarness = makePopoverButton("Drag Harness", `${state.dragHarness.length} samples`, () => openDragHarnessPopover(popover));
   const retrySaves = makePopoverButton("Retry failed saves", retryQueueCount() ? `${retryQueueCount()} queued` : "None", retryAllMutations, !retryQueueCount());
-  const restoreFixture = makePopoverButton("Export restore fixture", shellBridge?.exportRestoreFixture ? "Save As" : "Desktop only", () => exportRestoreFixtureFromMenu(popover), !shellBridge?.exportRestoreFixture);
-  const verifyProfile = makePopoverButton("Verify restore profile", shellBridge?.verifyRestoreProfile ? "Read only" : "Desktop only", () => verifyRestoreProfileFromMenu(popover), !shellBridge?.verifyRestoreProfile);
   const search = makePopoverButton("Search board", searchState.query ? `${searchState.results.length} matches` : "Ctrl / Cmd + F", () => openSearchPopover(popover));
-  const keyword = makePopoverButton("Keyword visibility", "Soon", null, true);
-  const privacy = makePopoverButton("Data and privacy", "Local only", () => openProfilePopover(popover), !shellBridge);
-  popover.append(title, search, retrySaves, always, profile, dragHarness, restoreFixture, verifyProfile, keyword, privacy);
+  const privacy = makePopoverButton("Data & Privacy", shellBridge ? "Backup / AI" : "Desktop only", null, !shellBridge);
+  privacy.dataset.action = "data-privacy";
+  privacy.addEventListener("click", (event) => { event.preventDefault(); event.stopPropagation(); openDataPrivacyPopover(popover); });
+  popover.append(title, search, retrySaves, always, dragHarness, privacy);
 }
 function renderSearchResults(popover) {
   const list = popover.querySelector(".search-results");
@@ -876,8 +1285,23 @@ function openSearchPopover(popover) {
 function renderChrome() {
   const currentDay = day();
   const date = activeDate();
-  titleButton.textContent = currentDay.title || formatMainDate(date);
-  dateLabel.textContent = currentDay.title ? formatSecondaryDate(date) : "Day Canvas";
+  if (state.viewMode === "weekly") {
+    titleButton.textContent = "Weekly Curation Slate";
+    dateLabel.textContent = formatWeekDate(date);
+  } else if (state.viewMode === "monthly") {
+    titleButton.textContent = "Monthly Inspiration Calendar";
+    dateLabel.textContent = formatMonthDate(date);
+  } else {
+    titleButton.textContent = currentDay.title || formatMainDate(date);
+    dateLabel.textContent = formatSecondaryDate(date);
+  }
+  modeSelector.querySelectorAll("[data-mode]").forEach((button) => {
+    const active = button.dataset.mode === state.viewMode;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
+  boardShell.classList.toggle("weekly-mode", state.viewMode === "weekly");
+  boardShell.classList.toggle("monthly-mode", state.viewMode === "monthly");
   const surface = surfaces[state.surface] || surfaces.quiet;
   boardShell.style.backgroundImage = surface.image ? `linear-gradient(rgb(244 241 233 / 58%), rgb(244 241 233 / 58%)), url("${surface.image}")` : "linear-gradient(rgb(244 241 233), rgb(244 241 233))";
 }
@@ -891,17 +1315,225 @@ function updateBoardDensityState() {
 }
 
 function renderCamera() {
+  if (isOverviewMode()) {
+    canvas.style.transform = "none";
+    zoomPercent.textContent = "100%";
+    updateBoardDensityState();
+    return;
+  }
   const cam = camera();
   canvas.style.transform = `translate(${cam.x}px, ${cam.y}px) scale(${cam.zoom})`;
   zoomPercent.textContent = `${Math.round(cam.zoom * 100)}%`;
   updateBoardDensityState();
 }
 
+function monthDayId(year, month, dayNumber) {
+  return dateKeyFromDate(new Date(year, month, dayNumber));
+}
+
+function openDayFromOverview(dayId) {
+  state.activeDayId = dayId;
+  state.viewMode = "day";
+  state.selectedId = null;
+  state.activeKeywordId = null;
+  state.expandedNoteId = null;
+  day();
+  renderChrome();
+  renderCanvas();
+  persist({ type: "day.select", payload: { activeDayId: state.activeDayId, viewMode: state.viewMode } });
+}
+
+function itemsForDay(dayId) {
+  return (state.days?.[dayId]?.items || []).filter((item) => item && !item.deleted);
+}
+
+function monthlyThumbSource(item) {
+  return item.thumbnailSrc || item.src || item.originalSrc || "";
+}
+
+function createMonthlyCell(dayId, dayNumber) {
+  const cell = document.createElement("button");
+  cell.type = "button";
+  cell.className = "monthly-cell";
+  const todayId = dateKeyFromDate(new Date());
+  cell.classList.toggle("selected", dayId === state.activeDayId);
+  cell.classList.toggle("today", dayId === todayId);
+  cell.setAttribute("aria-label", `Open ${formatSecondaryDate(dateFromDayId(dayId))}`);
+  const refs = itemsForDay(dayId);
+  const dayNumberNode = document.createElement("strong");
+  dayNumberNode.className = "monthly-day-number";
+  dayNumberNode.textContent = String(dayNumber);
+  cell.appendChild(dayNumberNode);
+  if (dayId === todayId) {
+    const badge = document.createElement("span");
+    badge.className = "monthly-today-badge";
+    badge.textContent = "Today";
+    cell.appendChild(badge);
+  }
+  if (refs.length) {
+    const thumbs = document.createElement("span");
+    thumbs.className = "monthly-thumbs";
+    refs.slice(0, 3).forEach((item) => {
+      const src = monthlyThumbSource(item);
+      if (src && item.kind !== "link") {
+        const img = document.createElement("img");
+        img.className = "monthly-thumb";
+        img.src = src;
+        img.alt = "";
+        thumbs.appendChild(img);
+      } else {
+        const fallback = document.createElement("span");
+        fallback.className = "monthly-thumb monthly-thumb-fallback";
+        fallback.textContent = item.kind === "link" ? "L" : "?";
+        thumbs.appendChild(fallback);
+      }
+    });
+    const count = document.createElement("span");
+    count.className = "monthly-ref-count";
+    count.textContent = `${refs.length} Ref${refs.length === 1 ? "" : "s"}`;
+    cell.append(thumbs, count);
+  } else {
+    const empty = document.createElement("span");
+    empty.className = "monthly-empty-text";
+    empty.textContent = "Empty";
+    cell.appendChild(empty);
+  }
+  cell.addEventListener("pointerdown", (event) => event.stopPropagation());
+  cell.addEventListener("click", (event) => {
+    event.stopPropagation();
+    openDayFromOverview(dayId);
+  });
+  return cell;
+}
+
+function createWeeklyCard(date, index) {
+  const dayId = dateKeyFromDate(date);
+  const refs = itemsForDay(dayId);
+  const card = document.createElement("button");
+  card.type = "button";
+  card.className = "weekly-card";
+  const todayId = dateKeyFromDate(new Date());
+  card.classList.toggle("today", dayId === todayId);
+  card.setAttribute("aria-label", `Open ${formatSecondaryDate(date)}`);
+  card.addEventListener("pointerdown", (event) => event.stopPropagation());
+  card.addEventListener("click", (event) => { event.stopPropagation(); openDayFromOverview(dayId); });
+
+  const head = document.createElement("span");
+  head.className = "weekly-card-head";
+  const weekday = document.createElement("strong");
+  weekday.textContent = new Intl.DateTimeFormat("en", { weekday: "short" }).format(date);
+  const label = document.createElement("em");
+  label.textContent = shortMonthDay(date);
+  head.append(weekday, label);
+
+  const title = document.createElement("span");
+  title.className = "weekly-card-title";
+  title.textContent = state.days?.[dayId]?.title || "Untitled Board";
+
+  const media = document.createElement("span");
+  media.className = "weekly-card-media";
+  if (refs.length) {
+    const stack = document.createElement("span");
+    stack.className = "weekly-thumb-stack";
+    refs.slice(0, 3).forEach((item, thumbIndex) => {
+      const src = monthlyThumbSource(item);
+      const wrap = document.createElement("span");
+      wrap.className = "weekly-thumb-sheet";
+      wrap.style.setProperty("--thumb-rotate", `${(thumbIndex - 1) * 9}deg`);
+      wrap.style.setProperty("--thumb-offset", `${(thumbIndex - 1) * 12}px`);
+      if (src && item.kind !== "link") {
+        const img = document.createElement("img");
+        img.src = src;
+        img.alt = "";
+        wrap.appendChild(img);
+      } else {
+        wrap.textContent = item.kind === "link" ? "L" : "?";
+      }
+      stack.appendChild(wrap);
+    });
+    media.appendChild(stack);
+  } else {
+    const empty = document.createElement("span");
+    empty.className = "weekly-empty-slate";
+    empty.innerHTML = `<span>Empty Slate</span><strong>+</strong>`;
+    media.appendChild(empty);
+  }
+
+  const foot = document.createElement("span");
+  foot.className = "weekly-card-foot";
+  const count = document.createElement("strong");
+  count.textContent = `${refs.length} Reference${refs.length === 1 ? "" : "s"}`;
+  const focus = document.createElement("em");
+  focus.textContent = "Focus ->";
+  foot.append(count, focus);
+  card.append(head, title, media, foot);
+  return card;
+}
+
+function renderWeeklyCanvas() {
+  canvas.classList.add("weekly-slate");
+  const board = document.createElement("div");
+  board.className = "weekly-board";
+  weekDaysForDate(activeDate()).forEach((date, index) => board.appendChild(createWeeklyCard(date, index)));
+  canvas.appendChild(board);
+}
+
+function renderMonthlyCanvas() {
+  canvas.classList.add("monthly-calendar");
+  const monthDate = activeDate();
+  const year = monthDate.getFullYear();
+  const month = monthDate.getMonth();
+  const monthStart = new Date(year, month, 1);
+  const blankCount = (monthStart.getDay() + 6) % 7;
+  const totalDays = new Date(year, month + 1, 0).getDate();
+  const board = document.createElement("div");
+  board.className = "monthly-board";
+  const head = document.createElement("div");
+  head.className = "monthly-board-head";
+  const label = document.createElement("h2");
+  label.textContent = formatMonthCaps(monthDate);
+  const hint = document.createElement("span");
+  hint.textContent = "Click any cell to navigate";
+  head.append(label, hint);
+  const weekdays = document.createElement("div");
+  weekdays.className = "monthly-weekdays";
+  ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].forEach((name) => {
+    const node = document.createElement("span");
+    node.textContent = name;
+    weekdays.appendChild(node);
+  });
+  const grid = document.createElement("div");
+  grid.className = "monthly-grid";
+  for (let i = 0; i < blankCount; i += 1) {
+    const blank = document.createElement("div");
+    blank.className = "monthly-cell monthly-cell-empty";
+    grid.appendChild(blank);
+  }
+  for (let dayNumber = 1; dayNumber <= totalDays; dayNumber += 1) grid.appendChild(createMonthlyCell(monthDayId(year, month, dayNumber), dayNumber));
+  board.append(head, weekdays, grid);
+  canvas.appendChild(board);
+}
+
 function renderCanvas() {
   canvas.innerHTML = "";
+  canvas.classList.toggle("weekly-slate", state.viewMode === "weekly");
+  canvas.classList.toggle("monthly-calendar", state.viewMode === "monthly");
+  if (state.viewMode === "weekly") {
+    renderWeeklyCanvas();
+    renderCamera();
+    return;
+  }
+  if (state.viewMode === "monthly") {
+    renderMonthlyCanvas();
+    renderCamera();
+    return;
+  }
+  canvas.classList.remove("weekly-slate", "monthly-calendar");
   items().slice().sort((a, b) => a.z - b.z).forEach((item) => canvas.appendChild(createBoardObject(item)));
   renderCamera();
 }
+
+function isMissingImportedMedia(item) { return item?.kind !== "link" && ["missing-reference", "unsupported-reference"].includes(item?.mediaResolution); }
 
 function createBoardObject(item) {
   return item.kind === "link" ? createLinkObject(item) : createImageObject(item);
@@ -923,6 +1555,7 @@ function createImageObject(item) {
   object.classList.toggle("capture-reference", item.lifecycleState === "REMOTE_REFERENCE");
   object.classList.toggle("capture-failed", item.lifecycleState === "FAILED");
   object.classList.toggle("capture-durable", item.lifecycleState === "DURABLE" || item.lifecycleState === "ORIGINAL_LOCAL");
+  object.classList.toggle("media-missing", isMissingImportedMedia(item));
   object.classList.toggle("mutation-pending", Boolean(item.pendingMutationIds?.length));
   object.classList.toggle("mutation-failed", Boolean(item.mutationError));
   decorateSearchState(object, item);
@@ -939,11 +1572,13 @@ function createImageObject(item) {
   frame.addEventListener("pointerdown", (event) => beginMove(event, item));
   frame.addEventListener("contextmenu", (event) => openContextMenu(event, item));
 
+  const missingMedia = isMissingImportedMedia(item);
   const img = document.createElement("img");
-  img.src = item.src;
+  img.src = item.src || "";
   img.alt = item.keywords[0] || "Captured image";
   img.draggable = false;
   img.addEventListener("load", () => { item.aspect = img.naturalHeight / img.naturalWidth; }, { once: true });
+  const missing = createMissingMediaPlaceholder(item);
 
   const lockMark = document.createElement("span");
   lockMark.className = "lock-mark";
@@ -952,7 +1587,8 @@ function createImageObject(item) {
   captureMark.className = "capture-state-mark";
   captureMark.textContent = item.mutationError ? "Retry needed" : captureStateLabel(item);
   captureMark.title = item.mutationError || item.captureError || item.derivativeError || "";
-  frame.append(createKeywordLayer(item), img, lockMark, captureMark);
+  frame.append(createKeywordLayer(item), missingMedia ? missing : img, lockMark, captureMark);
+  if (missingMedia) frame.appendChild(createMediaRepairActions(item));
   if (item.lifecycleState === "FAILED") frame.appendChild(createCaptureActions(item));
   if (item.mutationError) frame.appendChild(createMutationActions(item));
 
@@ -1031,14 +1667,131 @@ function createLinkObject(item) {
   return object;
 }
 
+function keywordConflictEntries(item) {
+  const seen = new Set();
+  return failedMutationsForTarget(item.id).filter((entry) => String(entry.mutation?.type || "").startsWith("keyword.")).filter((entry) => {
+    const key = [entry.mutation?.type, entry.mutation?.payload?.candidateId || entry.mutation?.payload?.keyword || entry.mutation?.id].join(":");
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function retryKeywordMutations(item) { retryMutations(keywordConflictEntries(item)); }
+
+function keepKeywordOptimisticState(item) {
+  const ids = keywordConflictEntries(item).map((entry) => entry.mutation.id);
+  removeRetryEntries(ids);
+  clearFailedMutationMarks(ids);
+  item.mutationError = failedMutationsForTarget(item.id).length ? item.mutationError : "";
+  persistRetryQueueMetadata();
+  saveState.textContent = retryQueueCount() ? "Needs retry" : "Saved";
+  renderCanvas();
+}
+
+function createKeywordConflictDetail(item) {
+  const conflicts = keywordConflictEntries(item);
+  if (!conflicts.length) return null;
+  const panel = document.createElement("div");
+  panel.className = "keyword-conflict-panel";
+  const title = document.createElement("strong");
+  title.textContent = "Keyword save needs attention";
+  const detail = document.createElement("span");
+  detail.textContent = conflicts.map((entry) => String(entry.mutation?.type || "keyword").replace("keyword.", "")).join(" / ");
+  detail.title = conflicts.map((entry) => entry.error || entry.mutation?.payload?.error || "Persistence ACK failed").join("; ");
+  const actions = document.createElement("div");
+  actions.className = "keyword-conflict-actions";
+  const retry = document.createElement("button");
+  retry.type = "button";
+  retry.textContent = "Retry keywords";
+  retry.addEventListener("pointerdown", (event) => event.stopPropagation());
+  retry.addEventListener("click", (event) => { event.stopPropagation(); retryKeywordMutations(item); });
+  const keep = document.createElement("button");
+  keep.type = "button";
+  keep.textContent = "Keep visible";
+  keep.addEventListener("pointerdown", (event) => event.stopPropagation());
+  keep.addEventListener("click", (event) => { event.stopPropagation(); keepKeywordOptimisticState(item); });
+  actions.append(retry, keep);
+  panel.append(title, detail, actions);
+  return panel;
+}
+
+function keywordGatewayRequest(item, providerId = profileState.keywordProvider?.activeProvider || "local-mock") {
+  return {
+    provider: providerId,
+    requestId: "kw-" + item.id + "-" + Date.now(),
+    object: {
+      id: item.id,
+      kind: item.kind || "image",
+      sourceType: item.sourceType || "",
+      sourceUrl: item.sourceUrl || item.url || "",
+      note: item.note || "",
+      keywords: [...(item.keywords || [])]
+    }
+  };
+}
+function cleanCandidateText(value) { return String(value || "").toLowerCase().replace(/[^a-z0-9\s-]/g, " ").replace(/\s+/g, " ").trim().slice(0, 48); }
+function localMockKeywordCandidates(item, requestId = "kw-local-" + Date.now()) {
+  const host = (() => { try { return new URL(item.sourceUrl || item.url || "").hostname.replace(/^www\./, "").split(/[.-]/); } catch { return []; } })();
+  const note = String(item.note || "").split(/[^a-zA-Z0-9]+/).filter((word) => word.length >= 4 && word.length <= 16).slice(0, 4);
+  const base = item.kind === "link" ? ["web reference", "source trail", "saved link"] : ["visual memory", "composition note", "material mood", "image reference"];
+  const seen = new Set([...(item.keywords || []).map(cleanCandidateText), ...cloneKeywordCandidates(item.keywordCandidates).filter((candidate) => candidate.state === "dismissed").map((candidate) => cleanCandidateText(candidate.text))]);
+  const values = [...base, item.sourceType || "", ...host, ...note, ...(item.keywords || []).map((keyword) => keyword + " variation")];
+  return values.map(cleanCandidateText).filter(Boolean).filter((text) => { if (seen.has(text)) return false; seen.add(text); return true; }).slice(0, AI_KEYWORD_MAX).map((text, index) => ({ id: requestId + "-cand-" + index, text, confidence: Number((0.82 - index * 0.04).toFixed(2)), source: "local-mock", provider: "local-mock", state: "suggested", createdAtUtc: new Date().toISOString() }));
+}
+function visibleKeywordCandidates(item) { return cloneKeywordCandidates(item.keywordCandidates).filter((candidate) => candidate.state === "suggested"); }
+async function generateKeywordCandidatesForItem(item, regenerate = false) {
+  const providerId = profileState.keywordProvider?.activeProvider || "local-mock";
+  item.aiKeywordState = "pending";
+  item.aiKeywordProvider = providerId;
+  if (regenerate) item.keywordCandidates = cloneKeywordCandidates(item.keywordCandidates).filter((candidate) => candidate.state === "accepted");
+  renderCanvas();
+  const request = keywordGatewayRequest(item, providerId);
+  try {
+    const response = shellBridge?.generateKeywordCandidates ? await shellBridge.generateKeywordCandidates(request) : { ok: true, candidates: localMockKeywordCandidates(item, request.requestId) };
+    if (!response?.ok) throw new Error(response?.error || "KEYWORD_MOCK_FAILED");
+    const dismissed = new Set(cloneKeywordCandidates(item.keywordCandidates).filter((candidate) => candidate.state === "dismissed").map((candidate) => candidate.text));
+    const fresh = cloneKeywordCandidates(response.candidates).filter((candidate) => !dismissed.has(candidate.text) && !(item.keywords || []).includes(candidate.text));
+    item.keywordCandidates = [...cloneKeywordCandidates(item.keywordCandidates).filter((candidate) => ["accepted", "dismissed"].includes(candidate.state)), ...fresh].slice(0, AI_KEYWORD_HISTORY_MAX);
+    item.aiKeywordState = fresh.length ? "suggested" : "empty";
+    item.aiKeywordError = "";
+    state.activeKeywordId = item.id;
+    renderCanvas();
+    persist({ type: "keyword.candidates", targetId: item.id, payload: { provider: response.provider || providerId, state: item.aiKeywordState, candidates: cloneKeywordCandidates(item.keywordCandidates) } });
+  } catch (error) {
+    item.aiKeywordState = "failed";
+    item.aiKeywordError = error?.message || "Keyword generation failed";
+    renderCanvas();
+    persist({ type: "keyword.candidates", targetId: item.id, payload: { provider: providerId, state: "failed", error: item.aiKeywordError, candidates: cloneKeywordCandidates(item.keywordCandidates) } });
+  }
+}
+function acceptKeywordCandidate(item, candidate, pin = false) {
+  const keyword = String(candidate.text || "").trim();
+  if (!keyword) return;
+  item.keywords = pin ? [keyword, ...(item.keywords || []).filter((value) => value !== keyword)] : [...(item.keywords || []).filter((value) => value !== keyword), keyword];
+  const reviewedAtUtc = new Date().toISOString();
+  item.keywordCandidates = cloneKeywordCandidates(item.keywordCandidates).map((entry) => entry.id === candidate.id ? { ...entry, state: "accepted", reviewedAtUtc, acceptedAtUtc: reviewedAtUtc, pinnedAtUtc: pin ? reviewedAtUtc : entry.pinnedAtUtc || "" } : entry);
+  item.aiKeywordState = visibleKeywordCandidates(item).length ? "suggested" : "reviewed";
+  state.activeKeywordId = item.id;
+  renderCanvas();
+  persist({ type: "keyword.accept", targetId: item.id, payload: { keyword, pin, keywords: [...item.keywords], candidates: cloneKeywordCandidates(item.keywordCandidates) } });
+}
+function dismissKeywordCandidate(item, candidate) {
+  const reviewedAtUtc = new Date().toISOString();
+  item.keywordCandidates = cloneKeywordCandidates(item.keywordCandidates).map((entry) => entry.id === candidate.id ? { ...entry, state: "dismissed", reviewedAtUtc, dismissedAtUtc: reviewedAtUtc } : entry);
+  item.aiKeywordState = visibleKeywordCandidates(item).length ? "suggested" : "reviewed";
+  renderCanvas();
+  persist({ type: "keyword.dismiss", targetId: item.id, payload: { candidateId: candidate.id, keyword: candidate.text, candidates: cloneKeywordCandidates(item.keywordCandidates) } });
+}
 function createKeywordLayer(item) {
   const layer = document.createElement("div");
   layer.className = "keyword-layer";
   const keywords = item.keywords?.length ? item.keywords : [item.kind === "link" ? "link capture" : "image first"];
+  const suggestions = visibleKeywordCandidates(item);
   const folded = document.createElement("button");
   folded.className = "keyword-folded";
   folded.type = "button";
-  folded.textContent = `${keywords[0]} +${Math.max(keywords.length - 1, 0)}`;
+  folded.textContent = suggestions.length ? keywords[0] + " +" + Math.max(keywords.length - 1, 0) + " / " + suggestions.length + " suggested" : keywords[0] + " +" + Math.max(keywords.length - 1, 0);
   folded.title = "Expand keywords";
   folded.addEventListener("pointerdown", (event) => event.stopPropagation());
   folded.addEventListener("click", (event) => { event.stopPropagation(); state.activeKeywordId = state.activeKeywordId === item.id ? null : item.id; renderCanvas(); });
@@ -1046,7 +1799,7 @@ function createKeywordLayer(item) {
   expanded.className = "keyword-expanded";
   keywords.forEach((keyword, index) => {
     const row = document.createElement("div");
-    row.className = `keyword-chip${index === 0 ? " pinned" : ""}`;
+    row.className = "keyword-chip" + (index === 0 ? " pinned" : "");
     const text = document.createElement("span");
     text.className = "keyword-text";
     text.textContent = keyword;
@@ -1054,19 +1807,83 @@ function createKeywordLayer(item) {
     text.addEventListener("pointerdown", (event) => event.stopPropagation());
     text.addEventListener("click", () => copyKeyword(keyword, expanded));
     text.addEventListener("dblclick", () => pinKeyword(item, keyword));
+    const pinButton = document.createElement("button");
+    pinButton.type = "button";
+    pinButton.className = "keyword-pin-button";
+    pinButton.ariaLabel = "Pin " + keyword;
+    pinButton.title = index === 0 ? "Pinned keyword" : "Pin keyword";
+    pinButton.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 4h8l-1 7 4 4v2h-6v4h-2v-4H5v-2l4-4-1-7Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>';
+    pinButton.addEventListener("pointerdown", (event) => event.stopPropagation());
+    pinButton.addEventListener("click", (event) => { event.stopPropagation(); pinKeyword(item, keyword); });
     const button = document.createElement("button");
     button.type = "button";
-    button.ariaLabel = `Copy ${keyword}`;
-    button.innerHTML = `<img src="${copyIcon}" alt="">`;
+    button.ariaLabel = "Copy " + keyword;
+    button.innerHTML = "<img src=\"" + copyIcon + "\" alt=\"\">";
     button.addEventListener("pointerdown", (event) => event.stopPropagation());
     button.addEventListener("click", () => copyKeyword(keyword, expanded));
-    row.append(text, button);
+    row.append(text, pinButton, button);
     expanded.appendChild(row);
   });
+  const aiPanel = document.createElement("div");
+  aiPanel.className = "ai-keyword-panel";
+  const aiHead = document.createElement("div");
+  aiHead.className = "ai-keyword-head";
+  const aiTitle = document.createElement("span");
+  aiTitle.textContent = item.aiKeywordState === "pending" ? "Suggesting" : "AI suggestions";
+  const generate = document.createElement("button");
+  generate.type = "button";
+  generate.textContent = suggestions.length ? "Regenerate" : "Suggest";
+  generate.title = (profileState.keywordProvider?.privacyLabel || "No remote AI request is made by default") + ". Suggestions never overwrite pinned keywords.";
+  generate.disabled = item.aiKeywordState === "pending";
+  generate.addEventListener("pointerdown", (event) => event.stopPropagation());
+  generate.addEventListener("click", (event) => { event.stopPropagation(); generateKeywordCandidatesForItem(item, suggestions.length > 0); });
+  aiHead.append(aiTitle, generate);
+  aiPanel.appendChild(aiHead);
+  if (item.aiKeywordState === "failed") {
+    const failed = document.createElement("span");
+    failed.className = "ai-keyword-empty";
+    failed.textContent = "Keyword provider failed";
+    failed.title = item.aiKeywordError || "";
+    aiPanel.appendChild(failed);
+  } else if (!suggestions.length) {
+    const empty = document.createElement("span");
+    empty.className = "ai-keyword-empty";
+    empty.textContent = item.aiKeywordState === "pending" ? "Local mock is preparing candidates" : "No unreviewed suggestions";
+    aiPanel.appendChild(empty);
+  }
+  suggestions.forEach((candidate) => {
+    const row = document.createElement("div");
+    row.className = "ai-keyword-candidate";
+    const text = document.createElement("span");
+    text.textContent = candidate.text;
+    text.title = "Suggested keyword. Accept or pin to make it searchable.";
+    const actions = document.createElement("span");
+    actions.className = "ai-keyword-actions";
+    const accept = document.createElement("button");
+    accept.type = "button";
+    accept.textContent = "Accept";
+    accept.addEventListener("pointerdown", (event) => event.stopPropagation());
+    accept.addEventListener("click", (event) => { event.stopPropagation(); acceptKeywordCandidate(item, candidate, false); });
+    const pin = document.createElement("button");
+    pin.type = "button";
+    pin.textContent = "Pin";
+    pin.addEventListener("pointerdown", (event) => event.stopPropagation());
+    pin.addEventListener("click", (event) => { event.stopPropagation(); acceptKeywordCandidate(item, candidate, true); });
+    const dismiss = document.createElement("button");
+    dismiss.type = "button";
+    dismiss.textContent = "Dismiss";
+    dismiss.addEventListener("pointerdown", (event) => event.stopPropagation());
+    dismiss.addEventListener("click", (event) => { event.stopPropagation(); dismissKeywordCandidate(item, candidate); });
+    actions.append(accept, pin, dismiss);
+    row.append(text, actions);
+    aiPanel.appendChild(row);
+  });
+  const keywordConflict = createKeywordConflictDetail(item);
+  if (keywordConflict) expanded.appendChild(keywordConflict);
+  expanded.appendChild(aiPanel);
   layer.append(folded, expanded);
   return layer;
 }
-
 function createQuickNote(item) {
   const note = document.createElement("section");
   note.className = "quick-note";
@@ -1112,7 +1929,80 @@ function showLocalFeedback(container, message) {
   container.appendChild(feedback);
   setTimeout(() => feedback.remove(), 1100);
 }
-function pinKeyword(item, keyword) { item.keywords = [keyword, ...item.keywords.filter((value) => value !== keyword)]; state.activeKeywordId = item.id; renderCanvas(); persist({ type: "keyword.pin", targetId: item.id, payload: { keyword, keywords: [...item.keywords] } }); }
+function pinKeyword(item, keyword) { item.keywords = [keyword, ...item.keywords.filter((value) => value !== keyword)]; state.activeKeywordId = item.id; renderCanvas(); persist({ type: "keyword.pin", targetId: item.id, payload: { keyword, keywords: [...item.keywords], candidates: cloneKeywordCandidates(item.keywordCandidates) } }); }
+
+function createMissingMediaPlaceholder(item) {
+  const placeholder = document.createElement("div");
+  placeholder.className = "missing-media-placeholder";
+  const title = document.createElement("strong");
+  title.textContent = item.mediaResolution === "unsupported-reference" ? "Unsupported media" : "Missing media";
+  const copy = document.createElement("span");
+  copy.textContent = item.sha256 ? "Choose the original file to restore this image." : "This imported image has no local media reference.";
+  placeholder.append(title, copy);
+  return placeholder;
+}
+
+function createMediaRepairActions(item) {
+  const actions = document.createElement("div");
+  actions.className = "media-repair-actions";
+  const relink = document.createElement("button");
+  relink.type = "button";
+  relink.textContent = "Relink file";
+  relink.disabled = !shellBridge?.repairImportedMedia || item.mediaRepairState === "pending";
+  relink.title = item.sha256 ? "Choose the matching original image file" : "No SHA-256 reference is available";
+  relink.addEventListener("pointerdown", (event) => event.stopPropagation());
+  relink.addEventListener("click", async (event) => { event.stopPropagation(); await repairImportedMediaForItem(item); });
+  const keep = document.createElement("button");
+  keep.type = "button";
+  keep.textContent = "Keep ref";
+  keep.title = "Keep this imported object as a visible reference";
+  keep.addEventListener("pointerdown", (event) => event.stopPropagation());
+  keep.addEventListener("click", (event) => { event.stopPropagation(); item.mediaRepairState = "kept-reference"; item.captureError = ""; renderCanvas(); persist({ type: "media.relink", targetId: item.id, payload: { state: "kept-reference", mediaResolution: item.mediaResolution || "missing-reference", importedFromId: item.importedFromId || "" } }); });
+  actions.append(relink, keep);
+  return actions;
+}
+
+async function repairImportedMediaForItem(item) {
+  if (!shellBridge?.repairImportedMedia) return;
+  item.mediaRepairState = "pending";
+  item.captureError = "";
+  saveState.textContent = "Relinking media";
+  renderCanvas();
+  try {
+    const response = await shellBridge.repairImportedMedia({
+      objectId: item.id,
+      importedFromId: item.importedFromId || "",
+      expectedSha256: item.sha256 || "",
+      captureId: "relink-" + item.id + "-" + Date.now(),
+      dayCanvasId: state.activeDayId,
+      boardDate: state.activeDayId,
+      imageObject: objectMutationPayload(item)
+    });
+    if (response?.canceled) { item.mediaRepairState = "idle"; saveState.textContent = "Relink canceled"; renderCanvas(); return; }
+    if (!response?.ok) throw new Error(response?.error || "MEDIA_RELINK_FAILED");
+    item.assetId = response.assetId;
+    item.sha256 = response.sha256;
+    item.originalRelpath = response.originalRelpath;
+    item.byteLength = response.byteLength || item.byteLength || 0;
+    item.originalSrc = response.originalRendererSrc || (response.assetId ? "app-media://asset/" + response.assetId + "?variant=original" : item.originalSrc);
+    item.thumbnailSrc = response.thumbnailSrc || (response.assetId ? "app-media://asset/" + response.assetId + "?variant=thumbnail" : item.thumbnailSrc);
+    item.src = response.rendererSrc || (response.assetId ? "app-media://asset/" + response.assetId + "?variant=working" : item.src);
+    item.lifecycleState = "DURABLE";
+    item.mediaResolution = "relinked-local";
+    item.mediaRepairState = "relinked";
+    item.captureError = "";
+    saveState.textContent = "Media relinked";
+    renderCanvas();
+    persist({ type: "media.relink", targetId: item.id, payload: { assetId: item.assetId, sha256: item.sha256, originalRelpath: item.originalRelpath, mediaResolution: item.mediaResolution, src: item.src } });
+  } catch (error) {
+    item.mediaRepairState = "failed";
+    item.captureError = error?.message || "Media relink failed";
+    saveState.textContent = "Relink failed";
+    saveState.title = item.captureError;
+    renderCanvas();
+    persist({ type: "media.relink", targetId: item.id, payload: { state: "failed", error: item.captureError, mediaResolution: item.mediaResolution || "missing-reference" } });
+  }
+}
 
 function createMutationActions(item) {
   const actions = document.createElement("div");
@@ -1197,6 +2087,7 @@ async function retryCapture(item) {
 }
 
 function captureStateLabel(item) {
+  if (isMissingImportedMedia(item)) return item.mediaRepairState === "failed" ? "Relink failed" : "Missing media";
   if (item.lifecycleState === "RESOLVING") return "Resolving";
   if (item.lifecycleState === "LOCALIZING") return "Localizing";
   if (item.lifecycleState === "REMOTE_REFERENCE") return "Reference";
@@ -1207,12 +2098,15 @@ function captureStateLabel(item) {
 }
 
 function beginPan(event) {
-  if (event.button !== 1) return;
-  if (event.target.closest(".title-area,.action-bar,.temporal-controls,.popover,.view-controls,.keyword-layer,.quick-note,.resize-handle")) return;
-  event.preventDefault(); event.stopPropagation(); closePopovers(); boardShell.classList.add("panning");
+  if (event.button !== 1 || isOverviewMode()) return;
+  const startedInsidePopover = Boolean(event.target.closest(".popover"));
+  if (!startedInsidePopover && event.target.closest(".title-area,.action-bar,.temporal-controls,.view-controls,.keyword-layer,.quick-note,.resize-handle")) return;
+  event.preventDefault(); event.stopPropagation();
+  if (!startedInsidePopover) closePopovers();
+  boardShell.classList.add("panning");
   const cam = camera();
   dragIntent = { type: "pan", origin: { pointerX: event.clientX, pointerY: event.clientY, cameraX: cam.x, cameraY: cam.y } };
-  boardShell.setPointerCapture(event.pointerId);
+  try { boardShell.setPointerCapture(event.pointerId); } catch {}
   document.addEventListener("pointermove", continuePointer);
   document.addEventListener("pointerup", endPointer, { once: true });
 }
@@ -1355,7 +2249,7 @@ function handleGlobalKeydown(event) {
   }
 }
 function handleWheelZoom(event) {
-  if (event.target.closest(".title-area,.action-bar,.temporal-controls,.popover,.view-controls")) return;
+  if (isOverviewMode() || event.target.closest(".title-area,.action-bar,.temporal-controls,.popover,.view-controls")) return;
   event.preventDefault(); closePopovers();
   const before = screenToWorld(event.clientX, event.clientY);
   const cam = camera();
@@ -1365,7 +2259,10 @@ function handleWheelZoom(event) {
   cam.zoom = Number(nextZoom.toFixed(3));
   renderCamera(); persist({ type: "camera.update", payload: { camera: { ...camera() }, source: "wheel" } });
 }
-function resetCamera() { day().camera = { ...DEFAULT_CAMERA }; renderCamera(); persist({ type: "camera.reset", payload: { camera: { ...day().camera } } }); }
+function resetCamera() {
+  if (isOverviewMode()) { saveState.textContent = state.viewMode === "weekly" ? "Weekly view" : "Monthly view"; setTimeout(() => { saveState.textContent = "Saved"; }, TRASH_FEEDBACK_MS); return; }
+  day().camera = { ...DEFAULT_CAMERA }; renderCamera(); persist({ type: "camera.reset", payload: { camera: { ...day().camera } } });
+}
 
 function comfortableInitialWidth(naturalWidth, naturalHeight) {
   const cam = camera();
@@ -1400,7 +2297,10 @@ function createCapturedImage(src, naturalSize, sourceType, worldPoint = null, op
     captureError: "",
     captureJobId: options.captureJobId || id,
     pendingDataUrl: String(src || "").startsWith("data:image/") ? src : "",
-    sourceUrl: options.sourceUrl || ""
+    sourceUrl: options.sourceUrl || "",
+    keywordCandidates: [],
+    aiKeywordState: "idle",
+    aiKeywordProvider: "local-mock"
   };
   currentDay.items.push(item);
   currentDay.pasteSequence += 1;
@@ -1427,7 +2327,10 @@ function createCapturedLink(url, worldPoint = null) {
     z: Math.max(...items().map((value) => value.z), 0) + 1,
     locked: false,
     keywords: ["link capture", previewLabel(url), "browser drag", "reference trail", "quiet archive"],
-    note: ""
+    note: "",
+    keywordCandidates: [],
+    aiKeywordState: "idle",
+    aiKeywordProvider: "local-mock"
   };
   currentDay.items.push(item);
   currentDay.pasteSequence += 1;
@@ -1462,7 +2365,7 @@ function firstUrlFromDrop(dataTransfer) {
 
 function captureImageObjectPayload(item, naturalSize, lifecycleState = "DURABLE") {
   const height = item.width * ((naturalSize.height || 1) / (naturalSize.width || 1));
-  return { id: item.id, sourceType: item.sourceType || "remote-url", sourceUrl: item.sourceUrl || item.src || "", capturedAt: item.capturedAt, x: item.x, y: item.y, width: item.width, height, z: item.z, locked: item.locked, note: item.note, keywords: item.keywords, lifecycleState, revision: 1 };
+  return { id: item.id, sourceType: item.sourceType || "remote-url", sourceUrl: item.sourceUrl || item.src || "", capturedAt: item.capturedAt, x: item.x, y: item.y, width: item.width, height, z: item.z, locked: item.locked, note: item.note, keywords: item.keywords, keywordCandidates: cloneKeywordCandidates(item.keywordCandidates), lifecycleState, revision: 1 };
 }
 function applyLocalizedCaptureResponse(item, response) {
   item.assetId = response.assetId;
@@ -1541,6 +2444,7 @@ async function commitLocalCapture(item, dataUrl, naturalSize, sourceType, candid
         locked: item.locked,
         note: item.note,
         keywords: item.keywords,
+        keywordCandidates: cloneKeywordCandidates(item.keywordCandidates),
         lifecycleState: "DURABLE",
         revision: 1
       },
@@ -1627,9 +2531,38 @@ async function handleDrop(event) {
 }
 
 function shiftDay(days) {
-  state.activeDayId = dateKeyFromDate(new Date(activeDate().getTime() + days * ONE_DAY));
+  const current = activeDate();
+  state.activeDayId = state.viewMode === "monthly" ? dateKeyFromDate(new Date(current.getFullYear(), current.getMonth() + days, 1)) : state.viewMode === "weekly" ? dateKeyFromDate(new Date(current.getTime() + days * ONE_DAY * 7)) : dateKeyFromDate(new Date(current.getTime() + days * ONE_DAY));
   state.selectedId = null; state.activeKeywordId = null; state.expandedNoteId = null;
-  day(); renderChrome(); renderCanvas(); persist({ type: "day.select", payload: { activeDayId: state.activeDayId } });
+  day(); renderChrome(); renderCanvas(); persist({ type: "day.select", payload: { activeDayId: state.activeDayId, viewMode: state.viewMode } });
+}
+
+function setViewMode(mode) {
+  const nextMode = ["day", "weekly", "monthly"].includes(mode) ? mode : "day";
+  state.viewMode = nextMode;
+  state.selectedId = null; state.activeKeywordId = null; state.expandedNoteId = null;
+  popoverLayer.innerHTML = "";
+  renderChrome();
+  renderCanvas();
+  persist({ type: "day.select", payload: { activeDayId: state.activeDayId, viewMode: state.viewMode } });
+}
+
+function openModePopover(event) {
+  event.stopPropagation();
+  const rect = modeSelector.getBoundingClientRect();
+  popoverLayer.innerHTML = "";
+  const popover = document.createElement("div");
+  popover.className = "popover mode-popover";
+  popover.addEventListener("pointerdown", beginPan, { capture: true });
+  popover.style.left = `${rect.left}px`;
+  popover.style.top = `${rect.bottom + 8}px`;
+  const title = document.createElement("h2");
+  title.textContent = "View Mode";
+  const dayButton = makePopoverButton("Day Canvas", state.viewMode === "day" ? "Current" : "Open", () => setViewMode("day"));
+  const weeklyButton = makePopoverButton("Weekly", state.viewMode === "weekly" ? "Current" : "Open", () => setViewMode("weekly"));
+  const monthlyButton = makePopoverButton("Monthly", state.viewMode === "monthly" ? "Current" : "Open", () => setViewMode("monthly"));
+  popover.append(title, dayButton, weeklyButton, monthlyButton);
+  popoverLayer.appendChild(popover);
 }
 
 function openContextMenu(event, item) {
@@ -1671,7 +2604,7 @@ function openTrashPopover(popover) {
   if (!entries.length) {
     const empty = document.createElement("p");
     empty.className = "trash-empty";
-    empty.textContent = "Trash is empty.";
+    empty.textContent = "Nothing in Trash";
     popover.appendChild(empty);
     return;
   }
@@ -1737,7 +2670,7 @@ function openTrashPopover(popover) {
 function exportSafeDayId() { return String(state.activeDayId || "day").replace(/[^0-9a-z-]/gi, "-"); }
 function exportFileStamp() { return new Date().toISOString().replace(/[:.]/g, "-"); }
 function sanitizeExportItem(item) {
-  const copy = { id: item.id, kind: item.kind || "image", x: item.x, y: item.y, width: item.width, z: item.z, locked: Boolean(item.locked), note: item.note || "", keywords: [...(item.keywords || [])], lifecycleState: item.lifecycleState || "READY", sourceType: item.sourceType || "", sourceUrl: item.sourceUrl || "", url: item.url || "", label: item.label || "", assetId: item.assetId || "", sha256: item.sha256 || "", originalRelpath: item.originalRelpath || "" };
+  const copy = { id: item.id, kind: item.kind || "image", x: item.x, y: item.y, width: item.width, z: item.z, locked: Boolean(item.locked), note: item.note || "", keywords: [...(item.keywords || [])], keywordCandidates: cloneKeywordCandidates(item.keywordCandidates), aiKeywordState: item.aiKeywordState || "idle", lifecycleState: item.lifecycleState || "READY", mediaResolution: item.mediaResolution || "", importedFromId: item.importedFromId || "", importBatchId: item.importBatchId || "", mediaRepairState: item.mediaRepairState || "", sourceType: item.sourceType || "", sourceUrl: item.sourceUrl || "", url: item.url || "", label: item.label || "", assetId: item.assetId || "", sha256: item.sha256 || "", originalRelpath: item.originalRelpath || "" };
   if (item.assetId) copy.media = { assetId: item.assetId, variants: { original: "app-media://asset/" + item.assetId + "?variant=original", working: "app-media://asset/" + item.assetId + "?variant=working", thumbnail: "app-media://asset/" + item.assetId + "?variant=thumbnail" } };
   if (item.src && !/^[a-z]:\\|^\\\\/i.test(item.src)) copy.src = item.src;
   return copy;
@@ -1746,6 +2679,72 @@ function buildCurrentDayExport() {
   const currentDay = day();
   return { schemaVersion: 1, product: "AestheticBoard", exportedAtUtc: new Date().toISOString(), activeDayId: state.activeDayId, surface: state.surface, day: { title: currentDay.title || "", camera: { ...currentDay.camera }, pasteSequence: currentDay.pasteSequence || 0, itemCount: currentDay.items.length, trashCount: currentDay.trash.length, items: currentDay.items.map(sanitizeExportItem), trash: currentDay.trash.map((entry) => ({ ...entry, item: entry.item ? sanitizeExportItem(entry.item) : null })) } };
 }
+function itemExportBounds(item) {
+  const width = Number(item.width || 240);
+  const baseHeight = item.kind === "link" ? 148 : width * Number(item.aspect || 0.75);
+  const noteAllowance = item.note ? 96 : 42;
+  return {
+    left: Number(item.x || 0) - 16,
+    top: Number(item.y || 0) - 42,
+    right: Number(item.x || 0) + width + 16,
+    bottom: Number(item.y || 0) + baseHeight + noteAllowance
+  };
+}
+
+function currentDayExportBounds() {
+  const currentItems = items();
+  if (!currentItems.length) return { ok: false, error: "FULL_DAY_EMPTY" };
+  const bounds = currentItems.map(itemExportBounds).reduce((acc, box) => ({
+    left: Math.min(acc.left, box.left),
+    top: Math.min(acc.top, box.top),
+    right: Math.max(acc.right, box.right),
+    bottom: Math.max(acc.bottom, box.bottom)
+  }), { left: Infinity, top: Infinity, right: -Infinity, bottom: -Infinity });
+  const padding = 120;
+  const width = Math.ceil(bounds.right - bounds.left + padding * 2);
+  const height = Math.ceil(bounds.bottom - bounds.top + padding * 2);
+  if (width * height > 60 * 1000 * 1000 || width > 10000 || height > 10000) return { ok: false, error: "Full-day export is too large for this pass", width, height };
+  return { ok: true, left: bounds.left - padding, top: bounds.top - padding, width, height };
+}
+
+function nextFrame() {
+  return new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+}
+
+async function exportFullDayPng(popover) {
+  const bounds = currentDayExportBounds();
+  if (!bounds.ok) { setExportStatus(popover, bounds.error || "Full-day export unavailable", true); return; }
+  if (!shellBridge?.captureFullDayPng) { setExportStatus(popover, "Full-day PNG is available in the desktop app", true); return; }
+  const cam = camera();
+  const previousCamera = { ...cam };
+  const previousSelected = state.selectedId;
+  const margin = 72;
+  const fitZoom = Math.min((window.innerWidth - margin * 2) / bounds.width, (window.innerHeight - margin * 2) / bounds.height, 1);
+  if (!Number.isFinite(fitZoom) || fitZoom <= 0.05) { setExportStatus(popover, "Full-day export is too large for this viewport", true); return; }
+  const filename = "aesthetic-board-full-day-" + exportSafeDayId() + "-" + exportFileStamp() + ".png";
+  setExportStatus(popover, "Framing full day");
+  try {
+    state.selectedId = null;
+    boardShell.classList.add("full-day-exporting");
+    cam.zoom = Number(fitZoom.toFixed(3));
+    cam.x = Math.round(margin - bounds.left * cam.zoom);
+    cam.y = Math.round(margin - bounds.top * cam.zoom);
+    renderCanvas();
+    await nextFrame();
+    const result = await shellBridge.captureFullDayPng({ filename, bounds });
+    if (result?.canceled) { setExportStatus(popover, "Export canceled"); return; }
+    if (!result?.ok) throw new Error(result?.error || "Full-day PNG export failed");
+    setExportStatus(popover, "Saved full-day PNG - " + (result.filePath || result.fileName || filename));
+  } catch (error) {
+    setExportStatus(popover, error?.message || "Full-day PNG export failed", true);
+  } finally {
+    Object.assign(cam, previousCamera);
+    state.selectedId = previousSelected;
+    boardShell.classList.remove("full-day-exporting");
+    renderCanvas();
+  }
+}
+
 function browserDownload(filename, content, mime) {
   const blob = new Blob([content], { type: mime }); const link = document.createElement("a");
   link.href = URL.createObjectURL(blob); link.download = filename; document.body.appendChild(link); link.click(); URL.revokeObjectURL(link.href); link.remove();
@@ -1764,9 +2763,10 @@ function openExportPopover(popover) {
   const title = document.createElement("h2"); title.textContent = "Download / Share";
   const json = makePopoverButton("Export day JSON", "Local metadata", () => exportCurrentDayJson(popover));
   const png = makePopoverButton("Export viewport PNG", shellBridge?.captureViewportPng ? "Desktop capture" : "Desktop only", () => exportViewportPng(popover), !shellBridge?.captureViewportPng);
+  const fullDayPng = makePopoverButton("Export full-day PNG", shellBridge?.captureFullDayPng ? "Whole day" : "Desktop only", () => exportFullDayPng(popover), !shellBridge?.captureFullDayPng);
   const help = document.createElement("p"); help.className = "export-help"; help.textContent = shellBridge ? "Desktop exports open a Save As window so you can choose the folder." : "Browser preview uses your browser download location; the desktop app lets you choose a folder.";
-  const status = document.createElement("div"); status.className = "export-status"; status.textContent = "Exports do not change the board";
-  popover.append(title, help, json, png, status);
+  const status = document.createElement("div"); status.className = "export-status"; status.textContent = "Choose an export format.";
+  popover.append(title, help, json, png, fullDayPng, status);
 }
 function openActionPopover(trigger) {
   const type = trigger.dataset.popover;
@@ -1774,6 +2774,7 @@ function openActionPopover(trigger) {
   popoverLayer.innerHTML = "";
   const popover = document.createElement("div");
   popover.className = "popover";
+  popover.addEventListener("pointerdown", beginPan, { capture: true });
   popover.style.left = `${rect.right + 10}px`;
   popover.style.top = `${rect.top}px`;
   if (type === "more") openMorePopover(popover);
@@ -1796,12 +2797,12 @@ function openActionPopover(trigger) {
 }
 function closePopovers() { searchState.open = false; searchState.query = ""; searchState.results = []; popoverLayer.innerHTML = ""; renderCanvas(); }
 
-titleButton.addEventListener("click", () => { titleArea.classList.add("editing"); titleEditor.value = day().title; titleEditor.placeholder = formatMainDate(activeDate()); titleEditor.style.width = `${Math.max(240, titleButton.offsetWidth + 24)}px`; titleEditor.focus(); });
+titleButton.addEventListener("click", () => { if (isOverviewMode()) return; titleArea.classList.add("editing"); titleEditor.value = day().title; titleEditor.placeholder = formatMainDate(activeDate()); titleEditor.style.width = `${Math.max(240, titleButton.offsetWidth + 24)}px`; titleEditor.focus(); });
 titleEditor.addEventListener("blur", () => { day().title = titleEditor.value.trim(); titleArea.classList.remove("editing"); renderChrome(); persist({ type: "day.title", payload: { title: day().title } }); });
 titleEditor.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === "Escape") titleEditor.blur(); });
 document.querySelector("#prev-day").addEventListener("click", () => shiftDay(-1));
 document.querySelector("#next-day").addEventListener("click", () => shiftDay(1));
-document.querySelector("#today").addEventListener("click", () => { state.activeDayId = dateKeyFromDate(new Date()); state.selectedId = null; state.activeKeywordId = null; state.expandedNoteId = null; day(); renderChrome(); renderCanvas(); persist({ type: "day.select", payload: { activeDayId: state.activeDayId, today: true } }); });
+document.querySelector("#today").addEventListener("click", () => { state.activeDayId = dateKeyFromDate(new Date()); state.selectedId = null; state.activeKeywordId = null; state.expandedNoteId = null; day(); renderChrome(); renderCanvas(); persist({ type: "day.select", payload: { activeDayId: state.activeDayId, viewMode: state.viewMode, today: true } }); });
 resetView.addEventListener("click", resetCamera);
 boardShell.addEventListener("wheel", handleWheelZoom, { passive: false });
 boardShell.addEventListener("pointerdown", beginPan);
@@ -1814,11 +2815,19 @@ document.addEventListener("paste", handlePaste);
 trashButton?.addEventListener("dragover", (event) => { event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = "move"; trashButton.classList.add("trash-hot"); });
 trashButton?.addEventListener("dragleave", () => clearTrashTarget());
 trashButton?.addEventListener("drop", storeDropInTrash);
-modeSelector.addEventListener("click", (event) => { event.stopPropagation(); const rect = modeSelector.getBoundingClientRect(); popoverLayer.innerHTML = ""; const popover = document.createElement("div"); popover.className = "popover"; popover.style.left = `${rect.left}px`; popover.style.top = `${rect.bottom + 8}px`; popover.innerHTML = `<h2>View Mode</h2><button type="button">Day Mode</button><button type="button" disabled>Weekly</button><button type="button" disabled>Monthly</button>`; popoverLayer.appendChild(popover); });
+modeSelector.addEventListener("click", (event) => {
+  const option = event.target.closest("[data-mode]");
+  if (!option) return;
+  event.stopPropagation();
+  setViewMode(option.dataset.mode);
+});
 document.querySelectorAll(".action-bar .icon-button").forEach((button) => button.addEventListener("click", (event) => { event.stopPropagation(); openActionPopover(button); }));
-canvas.addEventListener("pointerdown", () => { state.selectedId = null; state.activeKeywordId = null; closePopovers(); renderCanvas(); });
+canvas.addEventListener("pointerdown", (event) => {
+  if (isOverviewMode()) return;
+  state.selectedId = null; state.activeKeywordId = null; closePopovers(); renderCanvas();
+});
 document.addEventListener("keydown", handleGlobalKeydown);
-document.addEventListener("click", (event) => { if (!event.target.closest(".popover,.action-bar,.mode-selector,.view-controls")) closePopovers(); });
+document.addEventListener("click", (event) => { if (!event.target.closest(".popover,.action-bar,.view-mode-selector,.view-controls")) closePopovers(); });
 
 initializeShellBridge().finally(() => {
   renderChrome();

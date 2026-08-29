@@ -217,6 +217,110 @@ function recoverCaptureJobs(profileRoot) {
   return { ok: true, ...recovered, jobs: readCaptureJobs(profileRoot).jobs };
 }
 
+function imageFilesInFolder(folderPath, limit = 1200) {
+  const root = path.resolve(String(folderPath || ''));
+  const output = [];
+  const visit = (dir) => {
+    if (output.length >= limit) return;
+    fs.readdirSync(dir, { withFileTypes: true }).forEach((entry) => {
+      if (output.length >= limit) return;
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) { visit(fullPath); return; }
+      if (!entry.isFile()) return;
+      if (/\.(png|jpe?g|gif|webp)$/i.test(entry.name)) output.push(fullPath);
+    });
+  };
+  visit(root);
+  return output;
+}
+
+function shaForImageFile(filePath) {
+  const bytes = fs.readFileSync(filePath);
+  detectImage(bytes);
+  return crypto.createHash('sha256').update(bytes).digest('hex');
+}
+
+function previewRelinkFolder(folderPath, refs = []) {
+  const expected = (Array.isArray(refs) ? refs : []).filter((ref) => ref?.objectId && ref?.sha256).map((ref) => ({ objectId: String(ref.objectId), importedFromId: String(ref.importedFromId || ''), sha256: String(ref.sha256).toLowerCase() }));
+  const needed = new Map(expected.map((ref) => [ref.sha256, ref]));
+  const files = imageFilesInFolder(folderPath);
+  const matches = [];
+  let scanned = 0;
+  let unreadable = 0;
+  files.forEach((filePath) => {
+    try {
+      const sha256 = shaForImageFile(filePath);
+      scanned += 1;
+      const ref = needed.get(sha256);
+      if (ref && !matches.some((match) => match.sha256 === sha256)) matches.push({ ...ref, filePath, fileName: path.basename(filePath) });
+    } catch { unreadable += 1; }
+  });
+  const matchedIds = new Set(matches.map((match) => match.objectId));
+  const unmatched = expected.filter((ref) => !matchedIds.has(ref.objectId));
+  return { ok: true, scanned, unreadable, needed: expected.length, matched: matches.length, unmatched: unmatched.length, matches, unmatchedRefs: unmatched, folderName: path.basename(path.resolve(folderPath)) };
+}
+
+function commitRelinkMatches(profileRoot, matches = []) {
+  const repairs = [];
+  (Array.isArray(matches) ? matches : []).forEach((match, index) => {
+    const committed = commitFilePath(profileRoot, {
+      captureId: 'batch-relink-' + Date.now() + '-' + index,
+      dayCanvasId: match.dayCanvasId || 'undated',
+      boardDate: match.dayCanvasId || 'undated',
+      sourceType: 'import-media-batch-relink',
+      filePath: match.filePath,
+      expectedSha256: match.sha256 || '',
+      imageObject: match.imageObject || {},
+      candidateManifest: { importedFromId: match.importedFromId || '', repairOf: match.objectId || '' }
+    });
+    repairs.push({ objectId: match.objectId, importedFromId: match.importedFromId || '', ...committed, fileName: path.basename(match.filePath) });
+  });
+  return { ok: true, repaired: repairs.length, repairs };
+}
+
+function commitImageBytes(profileRoot, bytes, declaredMime, request) {
+  const captureId = String(request?.captureId || ('capture-' + Date.now()));
+  if (!Buffer.isBuffer(bytes)) throw new Error('MEDIA_BYTES_REQUIRED');
+  if (bytes.length <= 0) throw new Error('MEDIA_EMPTY_BYTES');
+  if (bytes.length > 25 * 1024 * 1024) throw new Error('MEDIA_TOO_LARGE');
+  const detected = detectImage(bytes);
+  if (declaredMime && declaredMime !== 'application/octet-stream' && declaredMime !== detected.mime) throw new Error('MEDIA_MIME_MAGIC_MISMATCH');
+  const sha256 = crypto.createHash('sha256').update(bytes).digest('hex');
+  if (request?.expectedSha256 && String(request.expectedSha256).toLowerCase() !== sha256) throw new Error('MEDIA_SHA256_MISMATCH');
+  const assetId = safeAssetId(sha256);
+  const stagingPath = path.join(profileRoot, 'staging', captureId + '.part');
+  const originalRelpath = portablePath('media', 'originals', sha256 + '.' + detected.ext);
+  const originalPath = path.join(profileRoot, originalRelpath);
+  fs.mkdirSync(path.dirname(stagingPath), { recursive: true });
+  fs.mkdirSync(path.dirname(originalPath), { recursive: true });
+  fs.writeFileSync(stagingPath, bytes);
+  const fsyncWarning = fsyncFile(stagingPath);
+  if (!fs.existsSync(originalPath)) fs.renameSync(stagingPath, originalPath);
+  else fs.rmSync(stagingPath, { force: true });
+
+  const index = readMediaIndex(profileRoot);
+  const previous = index.assets[assetId] || {};
+  const asset = {
+    ...previous,
+    assetId,
+    sha256,
+    originalRelpath,
+    mime: detected.mime,
+    byteLength: bytes.length,
+    sourceType: request?.sourceType || 'unknown',
+    createdAtUtc: previous.createdAtUtc || nowIso(),
+    updatedAtUtc: nowIso()
+  };
+  asset.variants = buildVariantRecords(profileRoot, asset);
+  index.assets[assetId] = asset;
+  writeMediaIndex(profileRoot, index);
+  const rendererSrc = assetUrl(assetId, 'working');
+  const originalRendererSrc = assetUrl(assetId, 'original');
+  const thumbnailSrc = assetUrl(assetId, 'thumbnail');
+  const captureJob = updateCaptureJob(profileRoot, captureId, { state: 'DURABLE', assetId, sha256, originalRelpath, rendererSrc, imageObject: request?.imageObject || null, lastErrorCode: '' });
+  return { assetId, sha256, originalRelpath, mime: detected.mime, byteLength: bytes.length, rendererSrc, originalRendererSrc, thumbnailSrc, variants: asset.variants, fsyncWarning, captureJob };
+}
+
 function commitDataUrl(profileRoot, request) {
   const captureId = String(request?.captureId || ('capture-' + Date.now()));
   updateCaptureJob(profileRoot, captureId, {
@@ -228,45 +332,33 @@ function commitDataUrl(profileRoot, request) {
   try {
     updateCaptureJob(profileRoot, captureId, { state: 'LOCALIZING' });
     const { declaredMime, bytes } = parseDataUrl(request?.dataUrl);
-    if (bytes.length <= 0) throw new Error('MEDIA_EMPTY_BYTES');
-    if (bytes.length > 25 * 1024 * 1024) throw new Error('MEDIA_TOO_LARGE');
-    const detected = detectImage(bytes);
-    if (declaredMime !== detected.mime) throw new Error('MEDIA_MIME_MAGIC_MISMATCH');
-    const sha256 = crypto.createHash('sha256').update(bytes).digest('hex');
-    const assetId = safeAssetId(sha256);
-    const stagingPath = path.join(profileRoot, 'staging', captureId + '.part');
-    const originalRelpath = portablePath('media', 'originals', sha256 + '.' + detected.ext);
-    const originalPath = path.join(profileRoot, originalRelpath);
-    fs.mkdirSync(path.dirname(stagingPath), { recursive: true });
-    fs.mkdirSync(path.dirname(originalPath), { recursive: true });
-    fs.writeFileSync(stagingPath, bytes);
-    const fsyncWarning = fsyncFile(stagingPath);
-    if (!fs.existsSync(originalPath)) fs.renameSync(stagingPath, originalPath);
-    else fs.rmSync(stagingPath, { force: true });
-
-    const index = readMediaIndex(profileRoot);
-    const previous = index.assets[assetId] || {};
-    const asset = {
-      ...previous,
-      assetId,
-      sha256,
-      originalRelpath,
-      mime: detected.mime,
-      byteLength: bytes.length,
-      sourceType: request?.sourceType || 'unknown',
-      createdAtUtc: previous.createdAtUtc || nowIso(),
-      updatedAtUtc: nowIso()
-    };
-    asset.variants = buildVariantRecords(profileRoot, asset);
-    index.assets[assetId] = asset;
-    writeMediaIndex(profileRoot, index);
-    const rendererSrc = assetUrl(assetId, 'working');
-    const originalRendererSrc = assetUrl(assetId, 'original');
-    const thumbnailSrc = assetUrl(assetId, 'thumbnail');
-    const captureJob = updateCaptureJob(profileRoot, captureId, { state: 'DURABLE', assetId, sha256, originalRelpath, rendererSrc, imageObject: request?.imageObject || null, lastErrorCode: '' });
-    return { assetId, sha256, originalRelpath, mime: detected.mime, byteLength: bytes.length, rendererSrc, originalRendererSrc, thumbnailSrc, variants: asset.variants, fsyncWarning, captureJob };
+    return commitImageBytes(profileRoot, bytes, declaredMime, request);
   } catch (error) {
     updateCaptureJob(profileRoot, captureId, { state: 'FAILED', lastErrorCode: error?.message || 'CAPTURE_COMMIT_FAILED' });
+    throw error;
+  }
+}
+
+function mimeFromFilePath(filePath) {
+  const ext = path.extname(String(filePath || '')).replace(/^\./, '').toLowerCase();
+  return extensionMime[ext] || 'application/octet-stream';
+}
+
+function commitFilePath(profileRoot, request) {
+  const captureId = String(request?.captureId || ('relink-' + Date.now()));
+  updateCaptureJob(profileRoot, captureId, {
+    state: 'QUEUED',
+    dayCanvasId: request?.dayCanvasId || request?.boardDate || 'undated',
+    sourceType: request?.sourceType || 'import-media-relink',
+    candidateManifest: request?.candidateManifest || {}
+  });
+  try {
+    updateCaptureJob(profileRoot, captureId, { state: 'LOCALIZING' });
+    const filePath = path.resolve(String(request?.filePath || ''));
+    const bytes = fs.readFileSync(filePath);
+    return commitImageBytes(profileRoot, bytes, mimeFromFilePath(filePath), request);
+  } catch (error) {
+    updateCaptureJob(profileRoot, captureId, { state: 'FAILED', lastErrorCode: error?.message || 'MEDIA_RELINK_FAILED' });
     throw error;
   }
 }
@@ -285,4 +377,4 @@ function resolveAssetPath(profileRoot, assetId, variant = 'original') {
   return { fullPath, mime: selected.mime || asset.mime || 'application/octet-stream', variant: selected.role || 'original', requestedVariant: requested, fallback: selected !== candidate };
 }
 
-module.exports = { commitDataUrl, resolveAssetPath, readCaptureJobs, updateCaptureJob, recoverCaptureJobs, repairMediaIndex, readMediaIndex };
+module.exports = { commitDataUrl, commitFilePath, previewRelinkFolder, commitRelinkMatches, resolveAssetPath, readCaptureJobs, updateCaptureJob, recoverCaptureJobs, repairMediaIndex, readMediaIndex };

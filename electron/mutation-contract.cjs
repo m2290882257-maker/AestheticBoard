@@ -1,6 +1,7 @@
 const allowedMutationTypes = new Set([
   'day.title',
   'day.select',
+  'day.import',
   'camera.update',
   'camera.reset',
   'object.createImage',
@@ -11,6 +12,9 @@ const allowedMutationTypes = new Set([
   'object.lock',
   'object.note',
   'keyword.pin',
+  'keyword.candidates',
+  'keyword.accept',
+  'keyword.dismiss',
   'trash.move',
   'trash.restore',
   'trash.delete',
@@ -18,6 +22,7 @@ const allowedMutationTypes = new Set([
   'surface.change',
   'workspace.alwaysOnTop',
   'capture.lifecycle',
+  'media.relink',
   'drag.harness',
   'snapshot.checkpoint'
 ]);
