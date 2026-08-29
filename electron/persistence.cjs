@@ -88,6 +88,19 @@ CREATE TABLE IF NOT EXISTS app_preference (
 `;
 
 function nowIso() { return new Date().toISOString(); }
+function snapshotPath(profileRoot) { return path.join(profileRoot, 'workspace-snapshot.json'); }
+
+function writeJsonAtomic(filePath, value) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const tempPath = filePath + '.tmp-' + process.pid + '-' + Date.now();
+  fs.writeFileSync(tempPath, JSON.stringify(value, null, 2));
+  fs.renameSync(tempPath, filePath);
+}
+
+function readJsonFile(filePath) {
+  try { return JSON.parse(fs.readFileSync(filePath, 'utf8')); }
+  catch { return null; }
+}
 
 function tryLoadSqlite() {
   try { return require('node:sqlite'); }
@@ -199,4 +212,54 @@ function insertDurableCapture(profileRoot, capture) {
   }
 }
 
-module.exports = { ensureMetadataStore, insertDurableCapture, schemaVersion };
+
+function saveSnapshotToSqlite(profileRoot, snapshot, now) {
+  const db = openDatabase(profileRoot);
+  if (!db) return { ok: false, error: 'SQLite driver unavailable' };
+  try {
+    db.exec('PRAGMA foreign_keys = ON;');
+    db.exec('BEGIN IMMEDIATE;');
+    db.prepare('INSERT OR REPLACE INTO app_preference (key, value_json, updated_at_utc) VALUES (?, ?, ?)').run('canvas_state', JSON.stringify(snapshot), now);
+    Object.entries(snapshot.days || {}).forEach(([dayId, day]) => {
+      db.prepare('INSERT OR IGNORE INTO day_canvas (id, board_date, title, created_at_utc, updated_at_utc) VALUES (?, ?, ?, ?, ?)').run(dayId, dayId, day.title || null, now, now);
+      db.prepare('UPDATE day_canvas SET title = ?, updated_at_utc = ? WHERE id = ?').run(day.title || null, now, dayId);
+      db.prepare('INSERT OR REPLACE INTO canvas_view_state (day_canvas_id, camera_x, camera_y, zoom, updated_at_utc) VALUES (?, ?, ?, ?, ?)').run(dayId, Number(day.camera?.x || 0), Number(day.camera?.y || 0), Number(day.camera?.zoom || 1), now);
+    });
+    db.exec('COMMIT;');
+    return { ok: true, database: 'metadata.sqlite' };
+  } catch (error) {
+    try { db.exec('ROLLBACK;'); } catch {}
+    return { ok: false, error: error?.message || 'Snapshot SQLite write failed' };
+  } finally {
+    db.close();
+  }
+}
+
+function saveWorkspaceSnapshot(profileRoot, snapshot) {
+  const now = nowIso();
+  const payload = {
+    ...(snapshot || {}),
+    persistenceRevision: Number(snapshot?.persistenceRevision || 0) + 1,
+    updatedAtUtc: now
+  };
+  writeJsonAtomic(snapshotPath(profileRoot), payload);
+  const sqlite = saveSnapshotToSqlite(profileRoot, payload, now);
+  return { ok: true, revision: payload.persistenceRevision, updatedAtUtc: now, sqlite };
+}
+
+function loadWorkspaceSnapshot(profileRoot) {
+  const snapshot = readJsonFile(snapshotPath(profileRoot));
+  if (snapshot) return { ok: true, source: 'workspace-snapshot.json', snapshot };
+  const db = openDatabase(profileRoot);
+  if (!db) return { ok: false, error: 'No snapshot available' };
+  try {
+    const row = db.prepare('SELECT value_json FROM app_preference WHERE key = ?').get('canvas_state');
+    if (!row?.value_json) return { ok: false, error: 'No snapshot available' };
+    return { ok: true, source: 'metadata.sqlite', snapshot: JSON.parse(row.value_json) };
+  } catch (error) {
+    return { ok: false, error: error?.message || 'Snapshot read failed' };
+  } finally {
+    db.close();
+  }
+}
+module.exports = { ensureMetadataStore, insertDurableCapture, saveWorkspaceSnapshot, loadWorkspaceSnapshot, schemaVersion };

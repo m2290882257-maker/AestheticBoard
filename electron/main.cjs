@@ -2,7 +2,7 @@ const { app, BrowserWindow, ipcMain, screen, protocol, net } = require('electron
 const fs = require('fs');
 const path = require('path');
 const { pathToFileURL } = require('url');
-const { ensureMetadataStore, insertDurableCapture } = require('./persistence.cjs');
+const { ensureMetadataStore, insertDurableCapture, saveWorkspaceSnapshot, loadWorkspaceSnapshot } = require('./persistence.cjs');
 const { commitDataUrl, resolveAssetPath } = require('./media-store.cjs');
 
 const stateFileName = 'workspace-state.json';
@@ -31,6 +31,43 @@ let workspaceState = {
 let profileState = null;
 let mediaProtocolRegistered = false;
 
+class PersistenceWorker {
+  constructor(rootProvider) {
+    this.rootProvider = rootProvider;
+    this.pendingSnapshot = null;
+    this.pendingResolvers = [];
+    this.timer = null;
+    this.lastAck = { revision: 0, updatedAtUtc: null };
+  }
+
+  enqueue(snapshot) {
+    this.pendingSnapshot = snapshot;
+    return new Promise((resolve) => {
+      this.pendingResolvers.push(resolve);
+      clearTimeout(this.timer);
+      this.timer = setTimeout(() => this.flush(), 180);
+    });
+  }
+
+  flush() {
+    const snapshot = this.pendingSnapshot;
+    const resolvers = this.pendingResolvers.splice(0);
+    this.pendingSnapshot = null;
+    this.timer = null;
+    let ack;
+    try {
+      ack = saveWorkspaceSnapshot(this.rootProvider(), snapshot || {});
+      this.lastAck = { revision: ack.revision, updatedAtUtc: ack.updatedAtUtc };
+    } catch (error) {
+      ack = { ok: false, error: error?.message || 'Persistence write failed', revision: this.lastAck.revision || 0 };
+    }
+    resolvers.forEach((resolve) => resolve(ack));
+  }
+
+  read() {
+    return loadWorkspaceSnapshot(this.rootProvider());
+  }
+}
 function localDataRoot() {
   return localDataDirectory;
 }
@@ -231,6 +268,19 @@ ipcMain.handle('workspace:set-always-on-top', (_event, value) => {
   return { alwaysOnTop: workspaceState.alwaysOnTop };
 });
 ipcMain.handle('profile:get-state', () => safeProfileState());
+ipcMain.handle('persistence:load-snapshot', () => {
+  const state = safeProfileState();
+  if (!state.ready) return { ok: false, error: state.error || 'Profile unavailable' };
+  if (!persistenceWorker) persistenceWorker = new PersistenceWorker(profileRoot);
+  return persistenceWorker.read();
+});
+ipcMain.handle('persistence:save-snapshot', (_event, snapshot) => {
+  const state = safeProfileState();
+  if (!state.ready) return { ok: false, error: state.error || 'Profile unavailable' };
+  if (!persistenceWorker) persistenceWorker = new PersistenceWorker(profileRoot);
+  return persistenceWorker.enqueue(snapshot || {});
+});
+
 ipcMain.handle('diagnostics:record-drag-probe', (_event, probe) => {
   const state = safeProfileState();
   if (!state.ready) return { ok: false, error: state.error || 'Profile unavailable' };

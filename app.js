@@ -53,6 +53,8 @@ let profileState = { ready: false, profileLabel: "Browser preview", directories:
 const state = loadState();
 let dragIntent = null;
 let saveTimer = 0;
+let latestPersistenceRequest = 0;
+let lastAckRevision = Number(state.persistenceRevision || 0);
 
 function startOfDay(date) { return new Date(date.getFullYear(), date.getMonth(), date.getDate()); }
 function padDatePart(value) { return String(value).padStart(2, "0"); }
@@ -122,13 +124,46 @@ function items() { return day().items; }
 function trashItems() { return day().trash; }
 function camera() { return day().camera; }
 
-function persist() {
+function applyRecoveredSnapshot(snapshot) {
+  if (!snapshot || typeof snapshot !== "object" || !snapshot.days) return false;
+  const recovered = normalizeState({ ...state, ...snapshot });
+  Object.keys(state).forEach((key) => delete state[key]);
+  Object.assign(state, recovered);
+  lastAckRevision = Number(recovered.persistenceRevision || 0);
+  return true;
+}
+
+function snapshotForPersistence() {
+  return JSON.parse(JSON.stringify({ ...state, persistenceRevision: lastAckRevision }));
+}
+
+function persist(options = {}) {
   saveState.textContent = "Saving";
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-    saveState.textContent = "Saved";
-  }, 220);
+  const delay = options.immediate ? 0 : 220;
+  saveTimer = setTimeout(async () => {
+    const requestId = ++latestPersistenceRequest;
+    const snapshot = snapshotForPersistence();
+    if (!shellBridge?.saveWorkspaceSnapshot) {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
+      lastAckRevision = Number(snapshot.persistenceRevision || 0);
+      if (requestId === latestPersistenceRequest) saveState.textContent = "Saved";
+      return;
+    }
+    try {
+      const ack = await shellBridge.saveWorkspaceSnapshot(snapshot);
+      if (!ack?.ok) throw new Error(ack?.error || "Save failed");
+      lastAckRevision = Number(ack.revision || lastAckRevision);
+      state.persistenceRevision = lastAckRevision;
+      saveState.title = "";
+      if (requestId === latestPersistenceRequest) saveState.textContent = "Saved";
+    } catch (error) {
+      if (requestId === latestPersistenceRequest) {
+        saveState.textContent = "Save failed";
+        saveState.title = error?.message || "Persistence ACK failed";
+      }
+    }
+  }, delay);
 }
 
 function formatMainDate(date) { return new Intl.DateTimeFormat("en", { month: "long", day: "numeric", weekday: "long" }).format(date); }
@@ -402,6 +437,12 @@ async function initializeShellBridge() {
   } catch {
     profileState = { ready: false, profileLabel: "Profile unavailable", directories: [] };
   }
+  try {
+    const recovered = await shellBridge.loadWorkspaceSnapshot?.();
+    if (recovered?.ok && applyRecoveredSnapshot(recovered.snapshot)) saveState.textContent = "Recovered";
+  } catch {
+    // A missing or failed snapshot keeps the immediate renderer fallback state.
+  }
 }
 
 async function toggleAlwaysOnTop() {
@@ -523,6 +564,7 @@ function createImageObject(item) {
   object.classList.toggle("selected", state.selectedId === item.id);
   object.classList.toggle("locked", item.locked);
   object.classList.toggle("keywords-open", state.activeKeywordId === item.id);
+  object.classList.toggle("capture-resolving", item.lifecycleState === "RESOLVING");
   object.classList.toggle("capture-localizing", item.lifecycleState === "LOCALIZING");
   object.classList.toggle("capture-failed", item.lifecycleState === "FAILED");
   object.classList.toggle("capture-durable", item.lifecycleState === "DURABLE" || item.lifecycleState === "ORIGINAL_LOCAL");
@@ -704,8 +746,10 @@ function showLocalFeedback(container, message) {
 function pinKeyword(item, keyword) { item.keywords = [keyword, ...item.keywords.filter((value) => value !== keyword)]; state.activeKeywordId = item.id; renderCanvas(); persist(); }
 
 function captureStateLabel(item) {
-  if (item.lifecycleState === "LOCALIZING") return "Saving";
-  if (item.lifecycleState === "FAILED") return "Needs retry";
+  if (item.lifecycleState === "RESOLVING") return "Resolving";
+  if (item.lifecycleState === "LOCALIZING") return "Localizing";
+  if (item.lifecycleState === "FAILED") return "Failed";
+  if (item.lifecycleState === "DURABLE") return "Durable";
   if (item.lifecycleState === "ORIGINAL_LOCAL") return "Local";
   return "";
 }
@@ -1015,9 +1059,19 @@ async function captureFile(file, sourceType, worldPoint) {
   await commitLocalCapture(item, src, naturalSize, sourceType, { fileName: file.name || "untitled", fileType: file.type || "", byteLength: file.size || 0 });
 }
 async function captureRemoteUrl(url, worldPoint) {
-  saveState.textContent = "Dropping";
-  const naturalSize = await imageSizeFromSource(url);
-  createCapturedImage(url, naturalSize, "browser-drag", worldPoint);
+  saveState.textContent = "Resolving";
+  const item = createCapturedImage(url, { width: 280, height: 210 }, "browser-drag", worldPoint, { lifecycleState: "RESOLVING" });
+  try {
+    const naturalSize = await imageSizeFromSource(url);
+    item.width = comfortableInitialWidth(naturalSize.width, naturalSize.height);
+    item.lifecycleState = "REMOTE_REFERENCE";
+    item.captureError = "";
+  } catch (error) {
+    item.lifecycleState = "FAILED";
+    item.captureError = error?.message || "Remote resolve failed";
+  }
+  renderCanvas();
+  persist();
 }
 
 async function handlePaste(event) {
@@ -1207,7 +1261,6 @@ document.addEventListener("click", (event) => { if (!event.target.closest(".popo
 initializeShellBridge().finally(() => {
   renderChrome();
   renderCanvas();
-  persist();
 });
 
 
