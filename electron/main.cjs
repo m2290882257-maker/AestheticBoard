@@ -30,6 +30,7 @@ let workspaceState = {
 };
 let profileState = null;
 let mediaProtocolRegistered = false;
+let persistenceWorker = null;
 
 class PersistenceWorker {
   constructor(rootProvider) {
