@@ -33,6 +33,8 @@ Implemented slices:
 | 19 | Done | Capture jobs are persisted as recoverable queue records; launch recovery scans staging/originals and failed jobs remain object-local. |
 | 20 | Done | Media assets now track original, working, and thumbnail variants; canvas uses working variant with original fallback. |
 | 21 | Done | Failed captures have object-local Retry, Keep Reference, and Remove actions; More includes profile details and media index repair. |
+| 22 | Done | Search index covers days, titles, keywords, notes, links, hosts, dates, and source types; results highlight objects without reflow and jump by camera. |
+| 23 | Done | Download / Share can export current-day JSON locally and desktop viewport PNG without mutating board state. |
 
 ## Verified Behaviors
 
@@ -44,6 +46,8 @@ Implemented slices:
 - Desktop drag/link capture issue was diagnosed through Drag Harness and fixed for custom DataTransfer payloads.
 - Trash now keeps discarded images/links until explicit delete or clear all.
 - Window bounds and always-on-top state are persisted by Electron shell state.
+- Search works across saved historical days and highlights current-day matches without moving or reordering objects.
+- Export JSON omits absolute local media paths and desktop PNG capture writes to the local Profile exports folder.
 
 ## Current Architecture Reality
 
@@ -54,6 +58,8 @@ The current codebase is still intentionally lightweight and prototype-shaped:
 - SQLite is accessed through `node:sqlite` when available and falls back to file snapshot persistence when unavailable.
 - Profile snapshot is stored as `workspace-snapshot.json`; typed mutation batches append to `logs/mutation-log.jsonl`, and SQLite also stores a `canvas_state` copy for metadata continuity.
 - Local captured images render through `app-media://asset/<assetId>?variant=working` with fallback to original; capture job recovery uses `capture-jobs.json` plus the media index to repair interrupted localizing jobs. Remote image URL capture remains a reference path and is not yet safely fetched/localized.
+- Search is currently a renderer-built read-only index over the loaded snapshot, not a dedicated SQLite FTS table yet.
+- Export is local-only: JSON works in browser preview or desktop; PNG capture is desktop-only through Electron `capturePage`.
 
 ## Known Technical Debt
 
@@ -65,48 +71,13 @@ The current codebase is still intentionally lightweight and prototype-shaped:
 
 ## Next Development Tasks
 
-### Slice 22: Search / Filter Foundation
-
-Goal: prepare retrieval without changing the spatial board model.
-
-Tasks:
-
-1. Index keyword text, note text, URL host/title, source type, capture date, and day title.
-2. Add read-only search overlay or command entry.
-3. Highlight matching objects without reflowing the canvas.
-4. Allow jump-to-object by adjusting camera, not object position.
-
-Acceptance:
-
-- Search results never reorder or move board objects.
-- Keyword/note edits update the searchable index after ACK.
-- Search works across historical days.
-
-### Slice 23: Export / Share First Pass
-
-Goal: turn current day into a simple local export without introducing cloud sync.
-
-Tasks:
-
-1. Export current day metadata as JSON.
-2. Export visible canvas or full day as PNG where feasible.
-3. Add export status to Download / Share popover.
-4. Include references to local media assets without exposing absolute paths in exported JSON unless explicitly requested.
-
-Acceptance:
-
-- Export never mutates board state.
-- Export failure is scoped to the export popover/status.
-- Exported JSON can be used later for import tests.
-
 ## Recommended Immediate Order
 
-1. Slice 22: Search / Filter Foundation.
-2. Slice 23: Export / Share First Pass.
-3. Slice 24: Mutation Retry Queue And Conflict Surface.
-4. Slice 25: Import / Restore Test Harness.
-5. Slice 26: Remote URL Localization Adapter.
-
+1. Slice 24: Mutation Retry Queue And Conflict Surface.
+2. Slice 25: Import / Restore Test Harness.
+3. Slice 26: Remote URL Localization Adapter.
+4. Slice 27: SQLite Search Index / FTS Upgrade.
+5. Slice 28: Import First Pass.
 
 ### Slice 24: Mutation Retry Queue And Conflict Surface
 

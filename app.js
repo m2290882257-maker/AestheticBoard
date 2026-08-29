@@ -55,6 +55,7 @@ let dragIntent = null;
 let saveTimer = 0;
 let latestPersistenceRequest = 0;
 let lastAckRevision = Number(state.persistenceRevision || 0);
+let searchState = { open: false, query: "", results: [], selectedIndex: 0 };
 
 function startOfDay(date) { return new Date(date.getFullYear(), date.getMonth(), date.getDate()); }
 function padDatePart(value) { return String(value).padStart(2, "0"); }
@@ -243,6 +244,7 @@ function persist(input = {}) {
       lastAckRevision = Number(snapshot.persistenceRevision || 0);
       settleMutations(request.mutations.map((mutation) => mutation.id));
       if (requestId === latestPersistenceRequest) saveState.textContent = "Saved";
+      refreshOpenSearch();
       renderCanvas();
       return;
     }
@@ -254,6 +256,7 @@ function persist(input = {}) {
       settleMutations(ack.mutationIds || request.mutations.map((mutation) => mutation.id));
       saveState.title = "";
       if (requestId === latestPersistenceRequest) saveState.textContent = "Saved";
+      refreshOpenSearch();
       renderCanvas();
     } catch (error) {
       const ids = request.mutations.map((mutation) => mutation.id);
@@ -270,6 +273,66 @@ function persist(input = {}) {
 function formatMainDate(date) { return new Intl.DateTimeFormat("en", { month: "long", day: "numeric", weekday: "long" }).format(date); }
 function formatSecondaryDate(date) { return new Intl.DateTimeFormat("en", { year: "numeric", month: "long", day: "numeric" }).format(date); }
 function screenToWorld(clientX, clientY) { const cam = camera(); return { x: (clientX - cam.x) / cam.zoom, y: (clientY - cam.y) / cam.zoom }; }
+function dateFromDayId(dayId) {
+  const parts = String(dayId || state.activeDayId).split("-").map(Number);
+  return new Date(parts[0] || new Date().getFullYear(), (parts[1] || 1) - 1, parts[2] || 1);
+}
+function normalizeSearchText(value) { return String(value || "").toLowerCase().replace(/\s+/g, " ").trim(); }
+function hostFromUrl(value) { try { return new URL(String(value || "")).host; } catch { return ""; } }
+function objectSearchText(item, board, dayId) {
+  return [item.kind || "image", item.sourceType || "", item.label || "", item.url || "", hostFromUrl(item.url), item.note || "", (item.keywords || []).join(" "), item.capturedAtUtc || item.createdAtUtc || "", dayId, board.title || "", formatMainDate(dateFromDayId(dayId))].join(" ");
+}
+function buildSearchIndex() {
+  const entries = [];
+  Object.entries(state.days || {}).forEach(([dayId, board]) => {
+    const dayTitle = board.title || formatMainDate(dateFromDayId(dayId));
+    entries.push({ id: "day:" + dayId, dayId, type: "day", title: dayTitle, preview: dayId, haystack: normalizeSearchText([dayTitle, dayId, formatSecondaryDate(dateFromDayId(dayId))].join(" ")) });
+    (board.items || []).forEach((item) => {
+      const title = item.kind === "link" ? (item.label || linkTitleFromUrl(item.url)) : (item.keywords?.[0] || "Image");
+      const preview = item.kind === "link" ? [hostFromUrl(item.url), item.note].filter(Boolean).join(" - ") : [item.note, (item.keywords || []).slice(1, 3).join(", ")].filter(Boolean).join(" - ");
+      entries.push({ id: item.id, dayId, type: item.kind || "image", title, preview: cleanPreview(preview, 110), item, haystack: normalizeSearchText(objectSearchText(item, board, dayId)) });
+    });
+  });
+  return entries;
+}
+function runSearch(query) {
+  searchState.query = query;
+  const q = normalizeSearchText(query);
+  searchState.results = q ? buildSearchIndex().filter((entry) => entry.haystack.includes(q)).slice(0, 80) : [];
+  searchState.selectedIndex = clamp(searchState.selectedIndex, 0, Math.max(searchState.results.length - 1, 0));
+  return searchState.results;
+}
+function decorateSearchState(object, item) {
+  const active = Boolean(normalizeSearchText(searchState.query));
+  const match = active && searchState.results.some((entry) => entry.dayId === state.activeDayId && entry.id === item.id);
+  object.classList.toggle("search-match", match);
+  object.classList.toggle("search-dimmed", active && !match);
+}
+function centerCameraOnItem(item) {
+  const cam = camera();
+  const width = Number(item.width || 240);
+  const height = Number(item.height || width * (item.aspect || 0.75));
+  cam.x = Math.round(window.innerWidth / 2 - (item.x + width / 2) * cam.zoom);
+  cam.y = Math.round(window.innerHeight / 2 - (item.y + height / 2) * cam.zoom);
+  renderCamera();
+}
+function jumpToSearchResult(result) {
+  if (!result) return;
+  state.activeDayId = result.dayId;
+  state.selectedId = result.type === "day" ? null : result.id;
+  state.activeKeywordId = null;
+  state.expandedNoteId = result.type === "day" ? null : result.id;
+  day(); renderChrome(); renderCanvas();
+  const item = result.type === "day" ? null : findItemAcrossDays(result.id);
+  if (item) centerCameraOnItem(item);
+}
+function refreshOpenSearch() {
+  const popover = popoverLayer.querySelector(".search-popover");
+  if (!popover) return;
+  const input = popover.querySelector(".search-input");
+  runSearch(input?.value || searchState.query);
+  renderSearchResults(popover);
+}
 
 
 function cleanPreview(value, limit = TEXT_PREVIEW_LIMIT) {
@@ -667,9 +730,42 @@ function openMorePopover(popover) {
   profile.className = "profile-status-row";
   profile.title = profileState.profileLabel || "Profile unavailable";
   const dragHarness = makePopoverButton("Drag Harness", `${state.dragHarness.length} samples`, () => openDragHarnessPopover(popover));
+  const search = makePopoverButton("Search board", searchState.query ? `${searchState.results.length} matches` : "Command", () => openSearchPopover(popover));
   const keyword = makePopoverButton("Keyword visibility", "Soon", null, true);
   const privacy = makePopoverButton("Data and privacy", "Local only", () => openProfilePopover(popover), !shellBridge);
-  popover.append(title, always, profile, dragHarness, keyword, privacy);
+  popover.append(title, search, always, profile, dragHarness, keyword, privacy);
+}
+function renderSearchResults(popover) {
+  const list = popover.querySelector(".search-results");
+  const count = popover.querySelector(".search-count");
+  if (!list || !count) return;
+  count.textContent = searchState.query ? searchState.results.length + " found" : "Type to search all days";
+  list.innerHTML = "";
+  if (!searchState.query) return;
+  if (!searchState.results.length) { const empty = document.createElement("div"); empty.className = "search-empty"; empty.textContent = "No matches"; list.appendChild(empty); return; }
+  searchState.results.forEach((result, index) => {
+    const button = document.createElement("button"); button.type = "button"; button.className = "search-result";
+    button.classList.toggle("selected", index === searchState.selectedIndex);
+    const title = document.createElement("span"); title.className = "search-result-title"; title.textContent = result.title || result.type;
+    const meta = document.createElement("span"); meta.className = "search-result-meta"; meta.textContent = [result.dayId, result.type, result.preview].filter(Boolean).join(" - ");
+    button.append(title, meta);
+    button.addEventListener("click", () => { searchState.selectedIndex = index; jumpToSearchResult(result); renderSearchResults(popover); });
+    list.appendChild(button);
+  });
+}
+function openSearchPopover(popover) {
+  searchState.open = true; popover.classList.add("search-popover"); popover.innerHTML = "";
+  const title = document.createElement("h2"); title.textContent = "Search Board";
+  const input = document.createElement("input"); input.className = "search-input"; input.type = "search"; input.placeholder = "Keyword, note, link, date"; input.value = searchState.query;
+  const count = document.createElement("div"); count.className = "search-count";
+  const list = document.createElement("div"); list.className = "search-results";
+  input.addEventListener("input", () => { searchState.selectedIndex = 0; runSearch(input.value); renderSearchResults(popover); renderCanvas(); });
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowDown") { event.preventDefault(); searchState.selectedIndex = clamp(searchState.selectedIndex + 1, 0, Math.max(searchState.results.length - 1, 0)); renderSearchResults(popover); }
+    if (event.key === "ArrowUp") { event.preventDefault(); searchState.selectedIndex = clamp(searchState.selectedIndex - 1, 0, Math.max(searchState.results.length - 1, 0)); renderSearchResults(popover); }
+    if (event.key === "Enter") { event.preventDefault(); jumpToSearchResult(searchState.results[searchState.selectedIndex]); }
+  });
+  popover.append(title, input, count, list); runSearch(searchState.query); renderSearchResults(popover); setTimeout(() => input.focus(), 0);
 }
 function renderChrome() {
   const currentDay = day();
@@ -722,6 +818,7 @@ function createImageObject(item) {
   object.classList.toggle("capture-durable", item.lifecycleState === "DURABLE" || item.lifecycleState === "ORIGINAL_LOCAL");
   object.classList.toggle("mutation-pending", Boolean(item.pendingMutationIds?.length));
   object.classList.toggle("mutation-failed", Boolean(item.mutationError));
+  decorateSearchState(object, item);
   object.tabIndex = 0;
   object.setAttribute("role", "group");
   object.setAttribute("aria-label", `${item.keywords?.[0] || "Captured image"}${item.locked ? ", locked" : ""}`);
@@ -777,6 +874,7 @@ function createLinkObject(item) {
   object.classList.toggle("keywords-open", state.activeKeywordId === item.id);
   object.classList.toggle("mutation-pending", Boolean(item.pendingMutationIds?.length));
   object.classList.toggle("mutation-failed", Boolean(item.mutationError));
+  decorateSearchState(object, item);
   object.tabIndex = 0;
   object.setAttribute("role", "group");
   object.setAttribute("aria-label", (item.label || "Captured link") + (item.locked ? ", locked" : ""));
@@ -1097,6 +1195,7 @@ function moveSelectedByKeyboard(event) {
 }
 
 function handleGlobalKeydown(event) {
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "f") { event.preventDefault(); const trigger = document.querySelector('[data-popover="more"]'); if (trigger) { openActionPopover(trigger); const popover = popoverLayer.querySelector(".popover"); if (popover) openSearchPopover(popover); } return; }
   if (event.target.closest("input,textarea,[contenteditable='true']")) return;
   if (event.key === "Escape") {
     state.activeKeywordId = null;
@@ -1445,6 +1544,39 @@ function openTrashPopover(popover) {
   });
   popover.appendChild(list);
 }
+function exportSafeDayId() { return String(state.activeDayId || "day").replace(/[^0-9a-z-]/gi, "-"); }
+function exportFileStamp() { return new Date().toISOString().replace(/[:.]/g, "-"); }
+function sanitizeExportItem(item) {
+  const copy = { id: item.id, kind: item.kind || "image", x: item.x, y: item.y, width: item.width, z: item.z, locked: Boolean(item.locked), note: item.note || "", keywords: [...(item.keywords || [])], lifecycleState: item.lifecycleState || "READY", sourceType: item.sourceType || "", url: item.url || "", label: item.label || "", assetId: item.assetId || "", sha256: item.sha256 || "", originalRelpath: item.originalRelpath || "" };
+  if (item.assetId) copy.media = { assetId: item.assetId, variants: { original: "app-media://asset/" + item.assetId + "?variant=original", working: "app-media://asset/" + item.assetId + "?variant=working", thumbnail: "app-media://asset/" + item.assetId + "?variant=thumbnail" } };
+  if (item.src && !/^[a-z]:\\|^\\\\/i.test(item.src)) copy.src = item.src;
+  return copy;
+}
+function buildCurrentDayExport() {
+  const currentDay = day();
+  return { schemaVersion: 1, product: "AestheticBoard", exportedAtUtc: new Date().toISOString(), activeDayId: state.activeDayId, surface: state.surface, day: { title: currentDay.title || "", camera: { ...currentDay.camera }, pasteSequence: currentDay.pasteSequence || 0, itemCount: currentDay.items.length, trashCount: currentDay.trash.length, items: currentDay.items.map(sanitizeExportItem), trash: currentDay.trash.map((entry) => ({ ...entry, item: entry.item ? sanitizeExportItem(entry.item) : null })) } };
+}
+function browserDownload(filename, content, mime) {
+  const blob = new Blob([content], { type: mime }); const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob); link.download = filename; document.body.appendChild(link); link.click(); URL.revokeObjectURL(link.href); link.remove();
+}
+function setExportStatus(popover, message, failed = false) { const status = popover.querySelector(".export-status"); if (!status) return; status.textContent = message; status.classList.toggle("failed", failed); }
+async function exportCurrentDayJson(popover) {
+  const filename = "aesthetic-board-" + exportSafeDayId() + "-" + exportFileStamp() + ".json"; const content = JSON.stringify(buildCurrentDayExport(), null, 2); setExportStatus(popover, "Preparing JSON");
+  try { if (shellBridge?.writeExportJson) { const result = await shellBridge.writeExportJson({ filename, content }); if (!result?.ok) throw new Error(result?.error || "JSON export failed"); setExportStatus(popover, "Saved JSON - " + (result.relativePath || filename)); } else { browserDownload(filename, content, "application/json"); setExportStatus(popover, "Downloaded JSON in browser"); } } catch (error) { setExportStatus(popover, error?.message || "JSON export failed", true); }
+}
+async function exportViewportPng(popover) {
+  setExportStatus(popover, "Capturing PNG");
+  try { if (!shellBridge?.captureViewportPng) throw new Error("PNG capture is available in the desktop app"); const filename = "aesthetic-board-" + exportSafeDayId() + "-" + exportFileStamp() + ".png"; const result = await shellBridge.captureViewportPng({ filename }); if (!result?.ok) throw new Error(result?.error || "PNG export failed"); setExportStatus(popover, "Saved PNG - " + (result.relativePath || filename)); } catch (error) { setExportStatus(popover, error?.message || "PNG export failed", true); }
+}
+function openExportPopover(popover) {
+  popover.classList.add("export-popover"); popover.innerHTML = "";
+  const title = document.createElement("h2"); title.textContent = "Download / Share";
+  const json = makePopoverButton("Export day JSON", "Local metadata", () => exportCurrentDayJson(popover));
+  const png = makePopoverButton("Export viewport PNG", shellBridge?.captureViewportPng ? "Desktop capture" : "Desktop only", () => exportViewportPng(popover), !shellBridge?.captureViewportPng);
+  const status = document.createElement("div"); status.className = "export-status"; status.textContent = "Exports do not change the board";
+  popover.append(title, json, png, status);
+}
 function openActionPopover(trigger) {
   const type = trigger.dataset.popover;
   const rect = trigger.getBoundingClientRect();
@@ -1467,11 +1599,11 @@ function openActionPopover(trigger) {
       popover.appendChild(button);
     });
   }
-  if (type === "export") popover.innerHTML = `<h2>Download / Share</h2><button type="button" disabled>Download current page</button><button type="button" disabled>Share current page</button>`;
+  if (type === "export") openExportPopover(popover);
   if (type === "trash") openTrashPopover(popover);
   popoverLayer.appendChild(popover);
 }
-function closePopovers() { popoverLayer.innerHTML = ""; }
+function closePopovers() { searchState.open = false; searchState.query = ""; searchState.results = []; popoverLayer.innerHTML = ""; renderCanvas(); }
 
 titleButton.addEventListener("click", () => { titleArea.classList.add("editing"); titleEditor.value = day().title; titleEditor.placeholder = formatMainDate(activeDate()); titleEditor.style.width = `${Math.max(240, titleButton.offsetWidth + 24)}px`; titleEditor.focus(); });
 titleEditor.addEventListener("blur", () => { day().title = titleEditor.value.trim(); titleArea.classList.remove("editing"); renderChrome(); persist({ type: "day.title", payload: { title: day().title } }); });

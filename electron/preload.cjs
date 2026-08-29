@@ -19,5 +19,7 @@ contextBridge.exposeInMainWorld('aestheticBoardShell', {
   commitCapturedMedia: (request) => ipcRenderer.invoke('capture:commit-data-url', request),
   repairMediaIndex: () => ipcRenderer.invoke('media:repair-index'),
   loadWorkspaceSnapshot: () => ipcRenderer.invoke('persistence:load-snapshot'),
-  saveWorkspaceMutations: (request) => ipcRenderer.invoke('persistence:save-mutations', mutationSummary(request))
+  saveWorkspaceMutations: (request) => ipcRenderer.invoke('persistence:save-mutations', mutationSummary(request)),
+  writeExportJson: (request) => ipcRenderer.invoke('export:write-json', { filename: String(request?.filename || ''), content: String(request?.content || '') }),
+  captureViewportPng: (request) => ipcRenderer.invoke('export:capture-viewport-png', { filename: String(request?.filename || '') })
 });

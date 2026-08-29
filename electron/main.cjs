@@ -22,7 +22,8 @@ const profileDirectories = [
   'media/thumbnails',
   'staging',
   'cache',
-  'logs'
+  'logs',
+  'exports'
 ];
 let mainWindow = null;
 let workspaceState = {
@@ -126,7 +127,8 @@ function ensureProfile() {
       mediaThumbnails: 'media/thumbnails',
       staging: 'staging',
       cache: 'cache',
-      logs: 'logs'
+      logs: 'logs',
+      exports: 'exports'
     }
   };
   writeJsonFile(manifestPath, manifest);
@@ -213,6 +215,37 @@ function mediaRequestFromUrl(value) {
   }
 }
 
+function sanitizeExportFileName(value, extension) {
+  const fallback = 'aesthetic-board-' + Date.now() + extension;
+  const name = String(value || fallback).replace(/[\\/:*?"<>|]/g, '-').replace(/\s+/g, '-').slice(0, 140);
+  return name.toLowerCase().endsWith(extension) ? name : name + extension;
+}
+function exportPathFor(filename, extension) {
+  const safeName = sanitizeExportFileName(filename, extension);
+  return { fullPath: path.join(profileRoot(), 'exports', safeName), relativePath: 'exports/' + safeName };
+}
+function writeExportJson(request) {
+  const state = safeProfileState();
+  if (!state.ready) return { ok: false, error: state.error || 'Profile unavailable' };
+  const content = String(request?.content || '');
+  if (!content || content.length > 10 * 1024 * 1024) return { ok: false, error: 'INVALID_EXPORT_JSON' };
+  try { JSON.parse(content); } catch { return { ok: false, error: 'EXPORT_JSON_PARSE_FAILED' }; }
+  const target = exportPathFor(request?.filename, '.json');
+  fs.mkdirSync(path.dirname(target.fullPath), { recursive: true });
+  fs.writeFileSync(target.fullPath, content, 'utf8');
+  return { ok: true, relativePath: target.relativePath, byteLength: Buffer.byteLength(content, 'utf8') };
+}
+async function captureViewportPng(request) {
+  const state = safeProfileState();
+  if (!state.ready) return { ok: false, error: state.error || 'Profile unavailable' };
+  if (!mainWindow || mainWindow.isDestroyed()) return { ok: false, error: 'WINDOW_UNAVAILABLE' };
+  const target = exportPathFor(request?.filename, '.png');
+  fs.mkdirSync(path.dirname(target.fullPath), { recursive: true });
+  const image = await mainWindow.webContents.capturePage();
+  const buffer = image.toPNG();
+  fs.writeFileSync(target.fullPath, buffer);
+  return { ok: true, relativePath: target.relativePath, byteLength: buffer.length };
+}
 function registerMediaProtocol() {
   if (mediaProtocolRegistered) return;
   mediaProtocolRegistered = true;
@@ -309,6 +342,8 @@ ipcMain.handle('persistence:save-mutations', (_event, request) => {
   return persistenceWorker.enqueue(validation.envelope);
 });
 
+ipcMain.handle('export:write-json', (_event, request) => writeExportJson(request));
+ipcMain.handle('export:capture-viewport-png', (_event, request) => captureViewportPng(request));
 ipcMain.handle('diagnostics:record-drag-probe', (_event, probe) => {
   const state = safeProfileState();
   if (!state.ready) return { ok: false, error: state.error || 'Profile unavailable' };
