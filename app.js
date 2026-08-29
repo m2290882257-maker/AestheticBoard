@@ -1560,22 +1560,23 @@ function browserDownload(filename, content, mime) {
   const blob = new Blob([content], { type: mime }); const link = document.createElement("a");
   link.href = URL.createObjectURL(blob); link.download = filename; document.body.appendChild(link); link.click(); URL.revokeObjectURL(link.href); link.remove();
 }
-function setExportStatus(popover, message, failed = false) { const status = popover.querySelector(".export-status"); if (!status) return; status.textContent = message; status.classList.toggle("failed", failed); }
+function setExportStatus(popover, message, failed = false) { const status = popover.querySelector(".export-status"); if (!status) return; status.textContent = message; status.title = message; status.classList.toggle("failed", failed); }
 async function exportCurrentDayJson(popover) {
   const filename = "aesthetic-board-" + exportSafeDayId() + "-" + exportFileStamp() + ".json"; const content = JSON.stringify(buildCurrentDayExport(), null, 2); setExportStatus(popover, "Preparing JSON");
-  try { if (shellBridge?.writeExportJson) { const result = await shellBridge.writeExportJson({ filename, content }); if (!result?.ok) throw new Error(result?.error || "JSON export failed"); setExportStatus(popover, "Saved JSON - " + (result.relativePath || filename)); } else { browserDownload(filename, content, "application/json"); setExportStatus(popover, "Downloaded JSON in browser"); } } catch (error) { setExportStatus(popover, error?.message || "JSON export failed", true); }
+  try { if (shellBridge?.writeExportJson) { const result = await shellBridge.writeExportJson({ filename, content }); if (result?.canceled) { setExportStatus(popover, "Export canceled"); return; } if (!result?.ok) throw new Error(result?.error || "JSON export failed"); setExportStatus(popover, "Saved JSON - " + (result.filePath || result.fileName || filename)); } else { browserDownload(filename, content, "application/json"); setExportStatus(popover, "Downloaded JSON in browser"); } } catch (error) { setExportStatus(popover, error?.message || "JSON export failed", true); }
 }
 async function exportViewportPng(popover) {
   setExportStatus(popover, "Capturing PNG");
-  try { if (!shellBridge?.captureViewportPng) throw new Error("PNG capture is available in the desktop app"); const filename = "aesthetic-board-" + exportSafeDayId() + "-" + exportFileStamp() + ".png"; const result = await shellBridge.captureViewportPng({ filename }); if (!result?.ok) throw new Error(result?.error || "PNG export failed"); setExportStatus(popover, "Saved PNG - " + (result.relativePath || filename)); } catch (error) { setExportStatus(popover, error?.message || "PNG export failed", true); }
+  try { if (!shellBridge?.captureViewportPng) throw new Error("PNG capture is available in the desktop app"); const filename = "aesthetic-board-" + exportSafeDayId() + "-" + exportFileStamp() + ".png"; const result = await shellBridge.captureViewportPng({ filename }); if (result?.canceled) { setExportStatus(popover, "Export canceled"); return; } if (!result?.ok) throw new Error(result?.error || "PNG export failed"); setExportStatus(popover, "Saved PNG - " + (result.filePath || result.fileName || filename)); } catch (error) { setExportStatus(popover, error?.message || "PNG export failed", true); }
 }
 function openExportPopover(popover) {
   popover.classList.add("export-popover"); popover.innerHTML = "";
   const title = document.createElement("h2"); title.textContent = "Download / Share";
   const json = makePopoverButton("Export day JSON", "Local metadata", () => exportCurrentDayJson(popover));
   const png = makePopoverButton("Export viewport PNG", shellBridge?.captureViewportPng ? "Desktop capture" : "Desktop only", () => exportViewportPng(popover), !shellBridge?.captureViewportPng);
+  const help = document.createElement("p"); help.className = "export-help"; help.textContent = shellBridge ? "Desktop exports open a Save As window so you can choose the folder." : "Browser preview uses your browser download location; the desktop app lets you choose a folder.";
   const status = document.createElement("div"); status.className = "export-status"; status.textContent = "Exports do not change the board";
-  popover.append(title, json, png, status);
+  popover.append(title, help, json, png, status);
 }
 function openActionPopover(trigger) {
   const type = trigger.dataset.popover;

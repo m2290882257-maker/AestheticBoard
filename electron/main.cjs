@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, screen, protocol, net } = require('electron');
+const { app, BrowserWindow, ipcMain, screen, protocol, net, dialog } = require('electron');
 const fs = require('fs');
 const path = require('path');
 const { pathToFileURL } = require('url');
@@ -220,31 +220,42 @@ function sanitizeExportFileName(value, extension) {
   const name = String(value || fallback).replace(/[\\/:*?"<>|]/g, '-').replace(/\s+/g, '-').slice(0, 140);
   return name.toLowerCase().endsWith(extension) ? name : name + extension;
 }
-function exportPathFor(filename, extension) {
+function defaultExportPath(filename, extension) {
   const safeName = sanitizeExportFileName(filename, extension);
-  return { fullPath: path.join(profileRoot(), 'exports', safeName), relativePath: 'exports/' + safeName };
+  return path.join(app.getPath('documents'), safeName);
 }
-function writeExportJson(request) {
+async function chooseExportPath(filename, extension, filters) {
+  const result = await dialog.showSaveDialog(mainWindow || undefined, {
+    title: 'Save AestheticBoard export',
+    defaultPath: defaultExportPath(filename, extension),
+    filters
+  });
+  if (result.canceled || !result.filePath) return null;
+  return result.filePath.toLowerCase().endsWith(extension) ? result.filePath : result.filePath + extension;
+}
+async function writeExportJson(request) {
   const state = safeProfileState();
   if (!state.ready) return { ok: false, error: state.error || 'Profile unavailable' };
   const content = String(request?.content || '');
   if (!content || content.length > 10 * 1024 * 1024) return { ok: false, error: 'INVALID_EXPORT_JSON' };
   try { JSON.parse(content); } catch { return { ok: false, error: 'EXPORT_JSON_PARSE_FAILED' }; }
-  const target = exportPathFor(request?.filename, '.json');
-  fs.mkdirSync(path.dirname(target.fullPath), { recursive: true });
-  fs.writeFileSync(target.fullPath, content, 'utf8');
-  return { ok: true, relativePath: target.relativePath, byteLength: Buffer.byteLength(content, 'utf8') };
+  const filePath = await chooseExportPath(request?.filename, '.json', [{ name: 'JSON', extensions: ['json'] }]);
+  if (!filePath) return { ok: false, canceled: true, error: 'Export canceled' };
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, content, 'utf8');
+  return { ok: true, filePath, fileName: path.basename(filePath), byteLength: Buffer.byteLength(content, 'utf8') };
 }
 async function captureViewportPng(request) {
   const state = safeProfileState();
   if (!state.ready) return { ok: false, error: state.error || 'Profile unavailable' };
   if (!mainWindow || mainWindow.isDestroyed()) return { ok: false, error: 'WINDOW_UNAVAILABLE' };
-  const target = exportPathFor(request?.filename, '.png');
-  fs.mkdirSync(path.dirname(target.fullPath), { recursive: true });
+  const filePath = await chooseExportPath(request?.filename, '.png', [{ name: 'PNG Image', extensions: ['png'] }]);
+  if (!filePath) return { ok: false, canceled: true, error: 'Export canceled' };
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const image = await mainWindow.webContents.capturePage();
   const buffer = image.toPNG();
-  fs.writeFileSync(target.fullPath, buffer);
-  return { ok: true, relativePath: target.relativePath, byteLength: buffer.length };
+  fs.writeFileSync(filePath, buffer);
+  return { ok: true, filePath, fileName: path.basename(filePath), byteLength: buffer.length };
 }
 function registerMediaProtocol() {
   if (mediaProtocolRegistered) return;

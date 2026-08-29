@@ -34,7 +34,7 @@ Implemented slices:
 | 20 | Done | Media assets now track original, working, and thumbnail variants; canvas uses working variant with original fallback. |
 | 21 | Done | Failed captures have object-local Retry, Keep Reference, and Remove actions; More includes profile details and media index repair. |
 | 22 | Done | Search index covers days, titles, keywords, notes, links, hosts, dates, and source types; results highlight objects without reflow and jump by camera. |
-| 23 | Done | Download / Share can export current-day JSON locally and desktop viewport PNG without mutating board state. |
+| 23 | Done | Download / Share can export current-day JSON locally and desktop viewport PNG without mutating board state; desktop exports use a Save As dialog. |
 
 ## Verified Behaviors
 
@@ -47,7 +47,7 @@ Implemented slices:
 - Trash now keeps discarded images/links until explicit delete or clear all.
 - Window bounds and always-on-top state are persisted by Electron shell state.
 - Search works across saved historical days and highlights current-day matches without moving or reordering objects.
-- Export JSON omits absolute local media paths and desktop PNG capture writes to the local Profile exports folder.
+- Export JSON omits absolute local media paths; desktop JSON and PNG exports open a Save As dialog so the user chooses the destination folder.
 
 ## Current Architecture Reality
 
@@ -59,7 +59,7 @@ The current codebase is still intentionally lightweight and prototype-shaped:
 - Profile snapshot is stored as `workspace-snapshot.json`; typed mutation batches append to `logs/mutation-log.jsonl`, and SQLite also stores a `canvas_state` copy for metadata continuity.
 - Local captured images render through `app-media://asset/<assetId>?variant=working` with fallback to original; capture job recovery uses `capture-jobs.json` plus the media index to repair interrupted localizing jobs. Remote image URL capture remains a reference path and is not yet safely fetched/localized.
 - Search is currently a renderer-built read-only index over the loaded snapshot, not a dedicated SQLite FTS table yet.
-- Export is local-only: JSON works in browser preview or desktop; PNG capture is desktop-only through Electron `capturePage`.
+- Export is local-only: JSON works in browser preview or desktop; PNG capture is desktop-only through Electron `capturePage`; desktop exports ask for a save path before writing.
 
 ## Known Technical Debt
 

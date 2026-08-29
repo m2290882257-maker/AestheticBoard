@@ -731,3 +731,10 @@
   color: var(--human-red);
   background: rgb(185 76 63 / 8%);
 }
+
+.export-help {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 17px;
+}
