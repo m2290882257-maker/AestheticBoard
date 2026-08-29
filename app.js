@@ -730,7 +730,7 @@ function openMorePopover(popover) {
   profile.className = "profile-status-row";
   profile.title = profileState.profileLabel || "Profile unavailable";
   const dragHarness = makePopoverButton("Drag Harness", `${state.dragHarness.length} samples`, () => openDragHarnessPopover(popover));
-  const search = makePopoverButton("Search board", searchState.query ? `${searchState.results.length} matches` : "Command", () => openSearchPopover(popover));
+  const search = makePopoverButton("Search board", searchState.query ? `${searchState.results.length} matches` : "Ctrl / Cmd + F", () => openSearchPopover(popover));
   const keyword = makePopoverButton("Keyword visibility", "Soon", null, true);
   const privacy = makePopoverButton("Data and privacy", "Local only", () => openProfilePopover(popover), !shellBridge);
   popover.append(title, search, always, profile, dragHarness, keyword, privacy);
