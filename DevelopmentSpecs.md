@@ -1818,3 +1818,19 @@ P0 开发规范被定义为：
 ---
 
 # End of DevelopmentSpecs.md v2.1
+
+---
+
+# Implementation Sync - 2026-08-29
+
+The live prototype has completed Slices 01-17. Current implemented behavior includes the board shell, temporal canvas, drag/paste image capture, link capture, trash retention, Electron desktop shell, Local Profile v1, SQLite metadata scaffold, local original media commit, app-media asset loading, Persistence Worker revision ACK, restart recovery, and per-image capture lifecycle UI.
+
+Current implementation notes:
+
+- Desktop `Saved` must mean a persistence ACK has returned from the main-process Persistence Worker.
+- Renderer remains responsible for immediate visual feedback only.
+- Move and resize are coalesced by interaction design: geometry updates visually during pointer movement and only the final state is persisted on pointerup.
+- Restart recovery currently uses `workspace-snapshot.json` as the primary Profile snapshot, with SQLite storing a `canvas_state` copy.
+- Capture failures must stay local to the affected image object and must not block the rest of the canvas.
+
+See `PROJECT_STATUS.md` for the current implementation matrix, known technical debt, and next slices.
