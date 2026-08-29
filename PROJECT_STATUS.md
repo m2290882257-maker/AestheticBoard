@@ -31,11 +31,14 @@ Implemented slices:
 | 17 | Done | Per-image capture lifecycle UI: Resolving, Localizing, Durable, Failed. Failures remain local to the image object. |
 | 18 | Done | Typed mutation envelopes now replace renderer arbitrary snapshot saves at the preload/main boundary while preserving ACK-based Saved state. |
 | 19 | Done | Capture jobs are persisted as recoverable queue records; launch recovery scans staging/originals and failed jobs remain object-local. |
+| 20 | Done | Media assets now track original, working, and thumbnail variants; canvas uses working variant with original fallback. |
+| 21 | Done | Failed captures have object-local Retry, Keep Reference, and Remove actions; More includes profile details and media index repair. |
 
 ## Verified Behaviors
 
 - Typed persistence validation rejects unsupported mutation types before they reach the worker.
 - Capture recovery validation marks interrupted localizing jobs as Failed and repairs durable jobs through the media index.
+- Derivative validation confirms original/working/thumbnail records, variant fallback, and media index repair.
 - `npm run check` passes across renderer, server, Electron main/preload, persistence, and media-store files.
 - Temporary Profile validation confirms snapshot ACK, SQLite migration/write, recovery read, media index, and app-media path resolution.
 - Desktop drag/link capture issue was diagnosed through Drag Harness and fixed for custom DataTransfer payloads.
@@ -50,7 +53,7 @@ The current codebase is still intentionally lightweight and prototype-shaped:
 - Persistence Worker is currently a main-process queue class, not a separate worker thread.
 - SQLite is accessed through `node:sqlite` when available and falls back to file snapshot persistence when unavailable.
 - Profile snapshot is stored as `workspace-snapshot.json`; typed mutation batches append to `logs/mutation-log.jsonl`, and SQLite also stores a `canvas_state` copy for metadata continuity.
-- Local captured images use `app-media://asset/<assetId>?variant=original`; capture job recovery uses `capture-jobs.json` plus the media index to repair interrupted localizing jobs. Remote image URL capture remains a reference path and is not yet safely fetched/localized.
+- Local captured images render through `app-media://asset/<assetId>?variant=working` with fallback to original; capture job recovery uses `capture-jobs.json` plus the media index to repair interrupted localizing jobs. Remote image URL capture remains a reference path and is not yet safely fetched/localized.
 
 ## Known Technical Debt
 
@@ -61,41 +64,6 @@ The current codebase is still intentionally lightweight and prototype-shaped:
 - Decide whether runtime UI labels remain English or need localized Chinese variants.
 
 ## Next Development Tasks
-
-### Slice 20: Thumbnail / Working Derivatives
-
-Goal: keep original immutable while rendering lighter working images on canvas.
-
-Tasks:
-
-1. Add media derivative records for original, working, and thumbnail variants.
-2. Generate thumbnails/working copies behind a media adapter.
-3. Update `app-media://asset/<assetId>?variant=...` to serve available variants.
-4. Keep original path immutable and never overwrite original bytes.
-5. Add fallback to original when derivative generation is pending or failed.
-
-Acceptance:
-
-- Canvas can render working variant without changing source original.
-- Trash and restore preserve media asset relation.
-- Missing derivative does not break the board.
-
-### Slice 21: Object-Level Retry And Repair UI
-
-Goal: complete the local failure model without modal interruptions.
-
-Tasks:
-
-1. Add compact object-local actions for Failed captures: Retry, Keep Reference, Remove.
-2. Add local tooltip/details for capture error code.
-3. Add Data & Privacy / Profile status detail in More menu.
-4. Add a lightweight repair action for rebuilding media index from originals.
-
-Acceptance:
-
-- Capture failure is understandable from the object itself.
-- No global modal appears for capture lifecycle failures.
-- Repair actions do not modify image positions, notes, or keywords.
 
 ### Slice 22: Search / Filter Foundation
 
@@ -133,12 +101,11 @@ Acceptance:
 
 ## Recommended Immediate Order
 
-1. Slice 20: Thumbnail / Working Derivatives.
-2. Slice 21: Object-Level Retry And Repair UI.
-3. Slice 22: Search / Filter Foundation.
-4. Slice 23: Export / Share First Pass.
-5. Slice 24: Mutation Retry Queue And Conflict Surface.
-6. Slice 25: Import / Restore Test Harness.
+1. Slice 22: Search / Filter Foundation.
+2. Slice 23: Export / Share First Pass.
+3. Slice 24: Mutation Retry Queue And Conflict Surface.
+4. Slice 25: Import / Restore Test Harness.
+5. Slice 26: Remote URL Localization Adapter.
 
 
 ### Slice 24: Mutation Retry Queue And Conflict Surface
@@ -173,3 +140,21 @@ Acceptance:
 - A developer can reproduce restart recovery scenarios from fixtures.
 - Verification never mutates the user board.
 - Fixture outputs avoid absolute local media paths unless explicitly requested.
+
+
+### Slice 26: Remote URL Localization Adapter
+
+Goal: convert supported remote image references into durable local media without blocking drag/drop.
+
+Tasks:
+
+1. Add a main-process fetch/localize path for remote image URLs with type and size validation.
+2. Reuse the capture job queue for remote URL jobs.
+3. Keep unsupported or failed remote URLs as references with object-local retry.
+4. Generate working/thumbnail derivatives after localization succeeds.
+
+Acceptance:
+
+- Remote image localization never blocks new captures.
+- Unsupported remote URLs remain usable as references.
+- Successful remote localization produces the same media index and derivative records as local captures.

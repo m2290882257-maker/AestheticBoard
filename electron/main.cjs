@@ -3,7 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const { pathToFileURL } = require('url');
 const { ensureMetadataStore, insertDurableCapture, saveWorkspaceSnapshot, loadWorkspaceSnapshot } = require('./persistence.cjs');
-const { commitDataUrl, resolveAssetPath, recoverCaptureJobs } = require('./media-store.cjs');
+const { commitDataUrl, resolveAssetPath, recoverCaptureJobs, repairMediaIndex } = require('./media-store.cjs');
 const { validatePersistenceEnvelope } = require('./mutation-contract.cjs');
 
 const stateFileName = 'workspace-state.json';
@@ -196,16 +196,20 @@ function visibleBounds(bounds) {
   };
 }
 
-function assetIdFromMediaUrl(value) {
+function mediaRequestFromUrl(value) {
   try {
     const url = new URL(value);
-    if (url.protocol !== 'app-media:') return '';
-    if (url.hostname === 'asset') return decodeURIComponent(url.pathname.replace(/^\//, ''));
-    const parts = url.pathname.split('/').filter(Boolean);
-    const assetIndex = parts.indexOf('asset');
-    return assetIndex >= 0 ? decodeURIComponent(parts[assetIndex + 1] || '') : '';
+    if (url.protocol !== 'app-media:') return { assetId: '', variant: 'original' };
+    let assetId = '';
+    if (url.hostname === 'asset') assetId = decodeURIComponent(url.pathname.replace(/^\//, ''));
+    else {
+      const parts = url.pathname.split('/').filter(Boolean);
+      const assetIndex = parts.indexOf('asset');
+      assetId = assetIndex >= 0 ? decodeURIComponent(parts[assetIndex + 1] || '') : '';
+    }
+    return { assetId, variant: url.searchParams.get('variant') || 'original' };
   } catch {
-    return '';
+    return { assetId: '', variant: 'original' };
   }
 }
 
@@ -215,8 +219,8 @@ function registerMediaProtocol() {
   protocol.handle('app-media', async (request) => {
     const state = safeProfileState();
     if (!state.ready) return new Response('Profile unavailable', { status: 503 });
-    const assetId = assetIdFromMediaUrl(request.url);
-    const asset = resolveAssetPath(profileRoot(), assetId);
+    const mediaRequest = mediaRequestFromUrl(request.url);
+    const asset = resolveAssetPath(profileRoot(), mediaRequest.assetId, mediaRequest.variant);
     if (!asset) return new Response('Asset not found', { status: 404 });
     return net.fetch(pathToFileURL(asset.fullPath).toString());
   });
@@ -277,6 +281,17 @@ ipcMain.handle('workspace:set-always-on-top', (_event, value) => {
   return { alwaysOnTop: workspaceState.alwaysOnTop };
 });
 ipcMain.handle('profile:get-state', () => safeProfileState());
+ipcMain.handle('media:repair-index', () => {
+  const state = safeProfileState();
+  if (!state.ready) return { ok: false, error: state.error || 'Profile unavailable' };
+  try {
+    const repair = repairMediaIndex(profileRoot());
+    profileState = { ...safeProfileState(), mediaRepair: repair };
+    return repair;
+  } catch (error) {
+    return { ok: false, error: error?.message || 'MEDIA_REPAIR_FAILED' };
+  }
+});
 ipcMain.handle('persistence:load-snapshot', () => {
   const state = safeProfileState();
   if (!state.ready) return { ok: false, error: state.error || 'Profile unavailable' };

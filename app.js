@@ -137,7 +137,10 @@ function objectMutationPayload(item) {
     lifecycleState: item.lifecycleState || "READY",
     assetId: item.assetId || "",
     url: item.url || "",
-    src: item.src || ""
+    src: item.src || "",
+    originalSrc: item.originalSrc || "",
+    thumbnailSrc: item.thumbnailSrc || "",
+    derivativeState: item.derivativeState || ""
   };
 }
 
@@ -167,7 +170,9 @@ function applyCaptureRecovery(recovery) {
       item.assetId = job.assetId || item.assetId;
       item.sha256 = job.sha256 || item.sha256;
       item.originalRelpath = job.originalRelpath || item.originalRelpath;
-      item.src = job.rendererSrc || item.src;
+      item.originalSrc = item.assetId ? `app-media://asset/${item.assetId}?variant=original` : item.originalSrc;
+      item.thumbnailSrc = item.assetId ? `app-media://asset/${item.assetId}?variant=thumbnail` : item.thumbnailSrc;
+      item.src = job.rendererSrc || (item.assetId ? `app-media://asset/${item.assetId}?variant=working` : item.src);
       item.captureError = "";
     }
     if (job.state === "FAILED") {
@@ -604,6 +609,52 @@ function openDragHarnessPopover(popover) {
   popover.appendChild(list);
 }
 
+function openProfilePopover(popover) {
+  popover.classList.add("profile-popover");
+  popover.innerHTML = "";
+  const title = document.createElement("h2");
+  title.textContent = "Profile";
+  const rows = document.createElement("div");
+  rows.className = "profile-detail-list";
+  const details = [
+    ["Storage", profileState.profileLabel || "Browser preview"],
+    ["Metadata", profileState.metadata?.ready ? "SQLite ready" : profileState.ready ? "File fallback" : "Unavailable"],
+    ["Recovery", profileState.captureRecovery?.failed?.length ? `${profileState.captureRecovery.failed.length} failed jobs` : "No pending jobs"],
+    ["Privacy", "Local profile only"]
+  ];
+  details.forEach(([label, value]) => {
+    const row = document.createElement("div");
+    row.className = "profile-detail-row";
+    const name = document.createElement("span");
+    name.textContent = label;
+    const detail = document.createElement("strong");
+    detail.textContent = value;
+    row.append(name, detail);
+    rows.appendChild(row);
+  });
+  const repair = document.createElement("button");
+  repair.type = "button";
+  repair.textContent = "Repair media index";
+  repair.disabled = !shellBridge?.repairMediaIndex;
+  repair.addEventListener("click", repairMediaIndexFromMenu);
+  popover.append(title, rows, repair);
+}
+
+async function repairMediaIndexFromMenu() {
+  if (!shellBridge?.repairMediaIndex) return;
+  saveState.textContent = "Repairing media";
+  try {
+    const result = await shellBridge.repairMediaIndex();
+    if (!result?.ok) throw new Error(result?.error || "Repair failed");
+    profileState.mediaRepair = result;
+    saveState.textContent = `Media repaired: ${result.originals} originals`;
+    openActionPopover(document.querySelector('[data-popover="more"]'));
+  } catch (error) {
+    saveState.textContent = "Repair failed";
+    saveState.title = error?.message || "Media repair failed";
+  }
+}
+
 function openMorePopover(popover) {
   popover.innerHTML = "";
   const title = document.createElement("h2");
@@ -612,12 +663,12 @@ function openMorePopover(popover) {
   const always = makePopoverButton("Always-on-top", status, toggleAlwaysOnTop, !shellBridge);
   always.dataset.action = "always-on-top";
   const profileDetail = profileState.metadata?.ready ? "SQLite ready" : profileState.ready ? "Files ready" : "Browser only";
-  const profile = makePopoverButton("Local profile", profileDetail, null, true);
+  const profile = makePopoverButton("Local profile", profileDetail, () => openProfilePopover(popover), !shellBridge);
   profile.className = "profile-status-row";
   profile.title = profileState.profileLabel || "Profile unavailable";
   const dragHarness = makePopoverButton("Drag Harness", `${state.dragHarness.length} samples`, () => openDragHarnessPopover(popover));
   const keyword = makePopoverButton("Keyword visibility", "Soon", null, true);
-  const privacy = makePopoverButton("Data and privacy", profileState.profileLabel || "Local only", null, true);
+  const privacy = makePopoverButton("Data and privacy", "Local only", () => openProfilePopover(popover), !shellBridge);
   popover.append(title, always, profile, dragHarness, keyword, privacy);
 }
 function renderChrome() {
@@ -696,7 +747,7 @@ function createImageObject(item) {
   const captureMark = document.createElement("span");
   captureMark.className = "capture-state-mark";
   captureMark.textContent = item.mutationError ? "Retry needed" : captureStateLabel(item);
-  captureMark.title = item.mutationError || item.captureError || "";
+  captureMark.title = item.mutationError || item.captureError || item.derivativeError || "";
   frame.append(createKeywordLayer(item), img, lockMark, captureMark);
   if (item.lifecycleState === "FAILED") frame.appendChild(createCaptureActions(item));
 
@@ -867,6 +918,15 @@ function createCaptureActions(item) {
     event.stopPropagation();
     await retryCapture(item);
   });
+  const keep = document.createElement("button");
+  keep.type = "button";
+  keep.textContent = "Keep Reference";
+  keep.title = item.captureError || "Keep visible source without localizing";
+  keep.addEventListener("pointerdown", (event) => event.stopPropagation());
+  keep.addEventListener("click", (event) => {
+    event.stopPropagation();
+    keepReference(item);
+  });
   const remove = document.createElement("button");
   remove.type = "button";
   remove.textContent = "Remove";
@@ -875,8 +935,17 @@ function createCaptureActions(item) {
     event.stopPropagation();
     moveImageToTrash(item.id);
   });
-  actions.append(retry, remove);
+  actions.append(retry, keep, remove);
   return actions;
+}
+
+function keepReference(item) {
+  item.lifecycleState = new RegExp("^https?://", "i").test(item.src || "") ? "REMOTE_REFERENCE" : "ORIGINAL_LOCAL";
+  item.captureError = "";
+  item.pendingDataUrl = "";
+  saveState.textContent = "Kept as reference";
+  renderCanvas();
+  persist({ type: "capture.lifecycle", targetId: item.id, payload: { state: item.lifecycleState, keptReference: true } });
 }
 
 async function retryCapture(item) {
@@ -1204,7 +1273,11 @@ async function commitLocalCapture(item, dataUrl, naturalSize, sourceType, candid
     item.byteLength = response.byteLength;
     item.captureJobId = response.captureJob?.id || item.captureJobId || item.id;
     item.pendingDataUrl = "";
-    item.src = response.rendererSrc || item.src;
+    item.originalSrc = response.originalRendererSrc || (response.assetId ? `app-media://asset/${response.assetId}?variant=original` : item.originalSrc);
+    item.thumbnailSrc = response.thumbnailSrc || (response.assetId ? `app-media://asset/${response.assetId}?variant=thumbnail` : item.thumbnailSrc);
+    item.derivativeState = response.variants?.working?.state || "ready";
+    item.derivativeError = response.variants?.working?.errorCode || "";
+    item.src = response.rendererSrc || (response.assetId ? `app-media://asset/${response.assetId}?variant=working` : item.src);
     item.lifecycleState = response.persistence?.ok ? "DURABLE" : "ORIGINAL_LOCAL";
     item.captureError = response.persistence?.ok ? "" : (response.persistence?.error || "SQLite unavailable");
     saveState.textContent = response.persistence?.ok ? "Saved" : "Saved local";

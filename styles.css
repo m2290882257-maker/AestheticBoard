@@ -598,3 +598,39 @@
   background: rgb(255 255 255 / 56%);
   color: var(--text-primary);
 }
+
+.profile-popover {
+  min-width: 300px;
+}
+
+.profile-detail-list {
+  display: grid;
+  gap: 6px;
+}
+
+.profile-detail-row {
+  display: grid;
+  grid-template-columns: 82px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  min-height: 24px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 16px;
+}
+
+.profile-detail-row strong {
+  overflow-wrap: anywhere;
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+.capture-actions {
+  max-width: calc(100% - 16px);
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.capture-actions button {
+  white-space: nowrap;
+}

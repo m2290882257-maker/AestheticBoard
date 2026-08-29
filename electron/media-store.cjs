@@ -12,6 +12,10 @@ const signatures = [
 const captureStates = new Set(['QUEUED', 'RESOLVING', 'LOCALIZING', 'DURABLE', 'FAILED', 'ABANDONED']);
 const incompleteStates = new Set(['QUEUED', 'RESOLVING', 'LOCALIZING']);
 const extensionMime = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp' };
+const derivativeSpecs = {
+  working: { folder: 'working', maxEdge: 1440 },
+  thumbnail: { folder: 'thumbnails', maxEdge: 360 }
+};
 function portablePath(...parts) { return path.join(...parts).split(path.sep).join('/'); }
 
 function nowIso() { return new Date().toISOString(); }
@@ -49,6 +53,55 @@ function fsyncFile(filePath) {
   }
 }
 function safeAssetId(sha256) { return 'asset-' + sha256.slice(0, 24); }
+function assetUrl(assetId, variant = 'working') { return 'app-media://asset/' + assetId + '?variant=' + encodeURIComponent(variant); }
+function fileRecord(relpath, mime, role, state = 'ready', extra = {}) {
+  return { role, state, relpath, mime, byteLength: extra.byteLength || 0, width: extra.width || 0, height: extra.height || 0, updatedAtUtc: nowIso(), errorCode: extra.errorCode || '' };
+}
+function safeFileStat(profileRoot, relpath) {
+  try { return fs.statSync(path.join(profileRoot, relpath)); }
+  catch { return null; }
+}
+function tryLoadNativeImage() {
+  try { return require('electron')?.nativeImage || null; }
+  catch { return null; }
+}
+function generateDerivative(profileRoot, originalPath, sha256, variant) {
+  const spec = derivativeSpecs[variant];
+  const relpath = portablePath('media', spec.folder, sha256 + '-' + variant + '.png');
+  const fullPath = path.join(profileRoot, relpath);
+  const nativeImage = tryLoadNativeImage();
+  try {
+    fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+    if (!nativeImage?.createFromBuffer) throw new Error('NATIVE_IMAGE_UNAVAILABLE');
+    const image = nativeImage.createFromBuffer(fs.readFileSync(originalPath));
+    if (!image || image.isEmpty()) throw new Error('DERIVATIVE_IMAGE_EMPTY');
+    const size = image.getSize();
+    const scale = Math.min(1, spec.maxEdge / Math.max(size.width || spec.maxEdge, size.height || spec.maxEdge));
+    const target = image.resize({ width: Math.max(1, Math.round((size.width || spec.maxEdge) * scale)), height: Math.max(1, Math.round((size.height || spec.maxEdge) * scale)), quality: 'good' });
+    if (!fs.existsSync(fullPath)) fs.writeFileSync(fullPath, target.toPNG());
+    const stat = fs.statSync(fullPath);
+    const finalSize = target.getSize();
+    return fileRecord(relpath, 'image/png', variant, 'ready', { byteLength: stat.size, width: finalSize.width || 0, height: finalSize.height || 0 });
+  } catch (error) {
+    return fileRecord(relpath, 'image/png', variant, 'failed', { errorCode: error?.message || 'DERIVATIVE_FAILED' });
+  }
+}
+function buildVariantRecords(profileRoot, asset) {
+  const originalStat = safeFileStat(profileRoot, asset.originalRelpath);
+  const variants = {
+    ...(asset.variants || {}),
+    original: fileRecord(asset.originalRelpath, asset.mime || asset.original_mime || 'application/octet-stream', 'original', originalStat ? 'ready' : 'missing', { byteLength: originalStat?.size || asset.byteLength || 0 })
+  };
+  if (originalStat) {
+    const originalPath = path.join(profileRoot, asset.originalRelpath);
+    Object.keys(derivativeSpecs).forEach((variant) => {
+      const existing = variants[variant];
+      if (existing?.state === 'ready' && fs.existsSync(path.join(profileRoot, existing.relpath))) return;
+      variants[variant] = generateDerivative(profileRoot, originalPath, asset.sha256, variant);
+    });
+  }
+  return variants;
+}
 function normalizeCaptureJob(job) {
   return {
     id: String(job?.id || ''),
@@ -103,21 +156,42 @@ function ensureMediaIndexFromOriginals(profileRoot) {
   if (fs.existsSync(originalsRoot)) {
     fs.readdirSync(originalsRoot).forEach((fileName) => {
       const asset = assetFromOriginalFile(fileName);
-      if (!asset || index.assets[asset.assetId]) return;
+      if (!asset) return;
       const fullPath = path.join(originalsRoot, fileName);
       const stat = fs.statSync(fullPath);
-      index.assets[asset.assetId] = {
+      const previous = index.assets[asset.assetId] || {};
+      const next = {
+        ...previous,
         ...asset,
-        byteLength: stat.size,
-        sourceType: 'recovered-original',
-        createdAtUtc: nowIso(),
+        byteLength: previous.byteLength || stat.size,
+        sourceType: previous.sourceType || 'recovered-original',
+        createdAtUtc: previous.createdAtUtc || nowIso(),
         updatedAtUtc: nowIso()
       };
+      next.variants = buildVariantRecords(profileRoot, next);
+      index.assets[asset.assetId] = next;
       changed = true;
     });
   }
   if (changed) writeMediaIndex(profileRoot, index);
   return index;
+}
+function repairMediaIndex(profileRoot) {
+  const index = ensureMediaIndexFromOriginals(profileRoot);
+  let originals = 0;
+  let workingReady = 0;
+  let thumbnailReady = 0;
+  let derivativeFailed = 0;
+  Object.values(index.assets || {}).forEach((asset) => {
+    originals += 1;
+    asset.variants = buildVariantRecords(profileRoot, asset);
+    if (asset.variants.working?.state === 'ready') workingReady += 1;
+    if (asset.variants.thumbnail?.state === 'ready') thumbnailReady += 1;
+    if (asset.variants.working?.state === 'failed') derivativeFailed += 1;
+    if (asset.variants.thumbnail?.state === 'failed') derivativeFailed += 1;
+  });
+  writeMediaIndex(profileRoot, index);
+  return { ok: true, originals, workingReady, thumbnailReady, derivativeFailed, updatedAtUtc: nowIso() };
 }
 function recoverCaptureJobs(profileRoot) {
   const queue = readCaptureJobs(profileRoot);
@@ -130,7 +204,7 @@ function recoverCaptureJobs(profileRoot) {
     if (job.sha256) {
       const assetId = job.assetId || safeAssetId(job.sha256);
       const indexed = index.assets[assetId];
-      if (indexed) next = updateCaptureJob(profileRoot, id, { ...job, state: 'DURABLE', assetId, originalRelpath: indexed.originalRelpath, rendererSrc: 'app-media://asset/' + assetId + '?variant=original', lastErrorCode: '' });
+      if (indexed) next = updateCaptureJob(profileRoot, id, { ...job, state: 'DURABLE', assetId, originalRelpath: indexed.originalRelpath, rendererSrc: assetUrl(assetId, 'working'), lastErrorCode: '' });
     }
     if (incompleteStates.has(next.state)) {
       const hasStaging = stagingParts.includes(id + '.part');
@@ -171,34 +245,44 @@ function commitDataUrl(profileRoot, request) {
     else fs.rmSync(stagingPath, { force: true });
 
     const index = readMediaIndex(profileRoot);
-    index.assets[assetId] = {
+    const previous = index.assets[assetId] || {};
+    const asset = {
+      ...previous,
       assetId,
       sha256,
       originalRelpath,
       mime: detected.mime,
       byteLength: bytes.length,
       sourceType: request?.sourceType || 'unknown',
-      createdAtUtc: index.assets[assetId]?.createdAtUtc || nowIso(),
+      createdAtUtc: previous.createdAtUtc || nowIso(),
       updatedAtUtc: nowIso()
     };
+    asset.variants = buildVariantRecords(profileRoot, asset);
+    index.assets[assetId] = asset;
     writeMediaIndex(profileRoot, index);
-    const rendererSrc = 'app-media://asset/' + assetId + '?variant=original';
+    const rendererSrc = assetUrl(assetId, 'working');
+    const originalRendererSrc = assetUrl(assetId, 'original');
+    const thumbnailSrc = assetUrl(assetId, 'thumbnail');
     const captureJob = updateCaptureJob(profileRoot, captureId, { state: 'DURABLE', assetId, sha256, originalRelpath, rendererSrc, imageObject: request?.imageObject || null, lastErrorCode: '' });
-    return { assetId, sha256, originalRelpath, mime: detected.mime, byteLength: bytes.length, rendererSrc, fsyncWarning, captureJob };
+    return { assetId, sha256, originalRelpath, mime: detected.mime, byteLength: bytes.length, rendererSrc, originalRendererSrc, thumbnailSrc, variants: asset.variants, fsyncWarning, captureJob };
   } catch (error) {
     updateCaptureJob(profileRoot, captureId, { state: 'FAILED', lastErrorCode: error?.message || 'CAPTURE_COMMIT_FAILED' });
     throw error;
   }
 }
 
-function resolveAssetPath(profileRoot, assetId) {
+function resolveAssetPath(profileRoot, assetId, variant = 'original') {
   const index = readMediaIndex(profileRoot);
   const asset = index.assets[String(assetId || '')];
   if (!asset) return null;
-  const fullPath = path.resolve(profileRoot, asset.originalRelpath);
-  const originalsRoot = path.resolve(profileRoot, 'media', 'originals');
-  if (!fullPath.startsWith(originalsRoot + path.sep)) return null;
-  return { fullPath, mime: asset.mime || 'application/octet-stream' };
+  const requested = ['original', 'working', 'thumbnail'].includes(String(variant)) ? String(variant) : 'original';
+  const candidate = asset.variants?.[requested];
+  const fallback = asset.variants?.original || { relpath: asset.originalRelpath, mime: asset.mime || 'application/octet-stream' };
+  const selected = candidate?.state === 'ready' && candidate.relpath && fs.existsSync(path.join(profileRoot, candidate.relpath)) ? candidate : fallback;
+  const fullPath = path.resolve(profileRoot, selected.relpath || asset.originalRelpath);
+  const mediaRoot = path.resolve(profileRoot, 'media');
+  if (!fullPath.startsWith(mediaRoot + path.sep)) return null;
+  return { fullPath, mime: selected.mime || asset.mime || 'application/octet-stream', variant: selected.role || 'original', requestedVariant: requested, fallback: selected !== candidate };
 }
 
-module.exports = { commitDataUrl, resolveAssetPath, readCaptureJobs, updateCaptureJob, recoverCaptureJobs };
+module.exports = { commitDataUrl, resolveAssetPath, readCaptureJobs, updateCaptureJob, recoverCaptureJobs, repairMediaIndex, readMediaIndex };
