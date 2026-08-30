@@ -5,11 +5,12 @@ const assert = require('assert');
 const { ensureMetadataStore, saveWorkspaceSnapshot, loadWorkspaceSnapshot, writeRetryQueue, readRetryQueue, approvedKeywordTexts } = require('../electron/persistence.cjs');
 const { commitFilePath, previewRelinkFolder, commitRelinkMatches, resolveAssetPath, generateAssetDerivatives } = require('../electron/media-store.cjs');
 const { validateRemoteImageUrl, detectRemoteImageInfo, assertImageSizeAllowed, maxRemoteImagePixels } = require('../electron/remote-policy.cjs');
-const { fullDayBoundsError, sanitizeExportFileName } = require('../electron/export-helpers.cjs');
+const { fullDayBoundsError, sanitizeExportFileName, exportPolicySummary } = require('../electron/export-helpers.cjs');
 const { generateMockKeywordCandidates, generateKeywordCandidates, buildKeywordRequest, keywordProviderState, validateKeywordProviderRequest, defaultProviderConfig, sanitizeProviderConfig, providerDiagnosticsFromConfig, providerKeyStatusFromConfig } = require('../electron/keyword-gateway.cjs');
 const { providerErrorCodes, buildProviderKeywordJob, validateProviderKeywordResponse, runProviderKeywordJob, qwenApiKey, qwenChatCompletionsUrl, testProviderConnection, qwenEffectiveOptions, extractPromptVersion, loadQwenPromptTemplate, mapHttpStatus } = require('../electron/ai-provider-connectors.cjs');
 const { validatePersistenceEnvelope, allowedMutationTypes } = require('../electron/mutation-contract.cjs');
 const { validateImportPayload, resolveImportMediaReferences } = require('../electron/import-media-resolution.cjs');
+const { writeStoredQwenApiKey, readStoredQwenApiKey, clearStoredQwenApiKey, qwenRuntimeEnv, rendererSafeKeyStatus: rendererSafeQwenKeyStatus } = require('../electron/api-key-store.cjs');
 
 function pngFixture(width, height) {
   const bytes = Buffer.alloc(33);
@@ -62,9 +63,11 @@ try {
   const importDate = new Date(Number(importDateMatch[1]), Number(importDateMatch[2]) - 1, Number(importDateMatch[3]));
   assert.strictEqual(Number.isNaN(importDate.getTime()), false, 'import day id date extraction remains valid');
 
-  assert.strictEqual(fullDayBoundsError({ width: 1600, height: 1200 }), '', 'normal full-day export bounds pass');
-  assert.strictEqual(fullDayBoundsError({ width: 12000, height: 200 }), 'FULL_DAY_EXPORT_TOO_LARGE', 'dimension guard works');
-  assert.strictEqual(fullDayBoundsError({ width: 9000, height: 9000 }), 'FULL_DAY_EXPORT_TOO_LARGE', 'pixel guard works');
+  assert.strictEqual(fullDayBoundsError({ width: 1600, height: 1200, itemCount: 12 }), '', 'normal full-day export bounds pass');
+  assert.strictEqual(fullDayBoundsError({ width: 1600, height: 1200, itemCount: 181 }), 'FULL_DAY_EXPORT_TOO_MANY_OBJECTS', 'object count export guard works');
+  assert.strictEqual(fullDayBoundsError({ width: 12000, height: 200, itemCount: 12 }), 'FULL_DAY_EXPORT_TOO_LARGE', 'dimension guard works');
+  assert.strictEqual(fullDayBoundsError({ width: 9000, height: 9000, itemCount: 12 }), 'FULL_DAY_EXPORT_TOO_LARGE', 'pixel guard works');
+  assert.ok(exportPolicySummary().includes('180 refs'), 'export policy explains object-count guard');
   assert.strictEqual(sanitizeExportFileName('bad:/name', '.json'), 'bad--name.json', 'export filename sanitized');
 
   expectCode('localhost blocked', () => validateRemoteImageUrl('http://localhost/a.png'), 'REMOTE_BLOCKED_LOCAL_HOST');
@@ -109,6 +112,19 @@ try {
   const rendererSafeKeyStatus = providerKeyStatusFromConfig(defaultConfig, { AESTHETICBOARD_QWEN_API_KEY: 'secret-value' });
   assert.deepStrictEqual(rendererSafeKeyStatus.qwen, { providerId: 'qwen3.7-flash', available: true, source: 'AESTHETICBOARD_QWEN_API_KEY', secretVisibleToRenderer: false }, 'renderer-safe key status exposes availability and source only');
   assert.strictEqual(JSON.stringify(rendererSafeKeyStatus).includes('secret-value'), false, 'renderer-safe key status never exposes secret value');
+  const fakeSafeStorage = { isEncryptionAvailable: () => true, encryptString: (value) => Buffer.from('enc:' + value, 'utf8'), decryptString: (buffer) => Buffer.from(buffer).toString('utf8').replace(/^enc:/, '') };
+  const storedKey = writeStoredQwenApiKey(tempRoot, 'stored-secret-value', fakeSafeStorage);
+  assert.strictEqual(storedKey.ok, true, 'secure Qwen key can be stored by main-side helper');
+  assert.strictEqual(readStoredQwenApiKey(tempRoot, fakeSafeStorage), 'stored-secret-value', 'secure Qwen key can be read by main-side helper');
+  const runtimeEnv = qwenRuntimeEnv(tempRoot, fakeSafeStorage, { AESTHETICBOARD_QWEN_API_KEY: 'env-secret-value' });
+  assert.strictEqual(runtimeEnv.AESTHETICBOARD_QWEN_API_KEY, 'stored-secret-value', 'secure stored Qwen key wins over development env key');
+  assert.strictEqual(runtimeEnv.AESTHETICBOARD_QWEN_API_KEY_SOURCE, 'secure storage', 'runtime Qwen key source reports secure storage');
+  const safeStoredStatus = rendererSafeQwenKeyStatus(tempRoot, fakeSafeStorage, { AESTHETICBOARD_QWEN_API_KEY: 'env-secret-value' });
+  assert.deepStrictEqual({ available: safeStoredStatus.available, source: safeStoredStatus.source, secretVisibleToRenderer: safeStoredStatus.secretVisibleToRenderer }, { available: true, source: 'secure storage', secretVisibleToRenderer: false }, 'renderer-safe key status prefers secure storage without exposing secret');
+  assert.strictEqual(JSON.stringify(safeStoredStatus).includes('stored-secret-value'), false, 'stored key never appears in renderer-safe key status');
+  const clearedKey = clearStoredQwenApiKey(tempRoot);
+  assert.strictEqual(clearedKey.ok, true, 'secure Qwen key can be cleared');
+  assert.strictEqual(readStoredQwenApiKey(tempRoot, fakeSafeStorage), '', 'cleared Qwen key is not readable');
   const qwenEffective = qwenEffectiveOptions(sanitizedQwen, { env: {} });
   assert.strictEqual(qwenEffective.model, 'qwen3.7-flash', 'Qwen effective options lock configured model');
   const provider = keywordProviderState(defaultConfig);
@@ -243,6 +259,15 @@ try {
   assert.ok(appSource.includes('function recoverAiJobsForLaunch'), 'renderer has launch-time AI job recovery helper');
   assert.ok(appSource.includes('AI_JOB_INTERRUPTED'), 'renderer marks interrupted AI jobs with explicit error copy');
   assert.ok(appSource.includes('aiJobKeyFor'), 'renderer keeps AI job dedupe key based on object/asset/provider/model/prompt/locale');
+  assert.ok(appSource.includes('const aiAutoKeywordQueue'), 'renderer has a session auto-keyword queue');
+  assert.ok(appSource.includes('function queueAutoKeywordItem'), 'renderer queues auto keyword jobs instead of firing every drop immediately');
+  assert.ok(appSource.includes('hasUnreviewedKeywordCandidates'), 'batch keyword generation skips existing unreviewed suggestions');
+  assert.ok(appSource.includes('hasCanceledAiKeywordJob'), 'auto and batch keyword generation skip user-canceled jobs');
+  assert.ok(appSource.includes('Waiting for image save'), 'non-durable images wait instead of showing a hard AI failure');
+  assert.ok(appSource.includes('function qwenReadinessText'), 'More AI panel has user-facing readiness copy');
+  assert.ok(appSource.includes('Save Qwen key'), 'Data and Privacy exposes secure Qwen key storage entry');
+  assert.ok(appSource.includes('Clear saved key'), 'Data and Privacy exposes secure Qwen key removal entry');
+  assert.strictEqual(appSource.includes(' 路 '), false, 'AI status copy contains no mojibake separator');
 
   const candidateReviewSnapshot = { activeDayId: '2026-08-29', days: { '2026-08-29': { title: 'Candidate review day', camera: {}, items: [{ id: 'candidate-review', kind: 'image', keywords: ['pinned archival'], keywordCandidates: [
     { id: 'cand-accepted', text: 'pinned archival', confidence: 0.91, source: 'local-mock', provider: 'local-mock', state: 'accepted', createdAtUtc: '2026-08-29T01:00:00.000Z', reviewedAtUtc: '2026-08-29T01:01:00.000Z', acceptedAtUtc: '2026-08-29T01:01:00.000Z', pinnedAtUtc: '2026-08-29T01:01:00.000Z' },
@@ -279,7 +304,7 @@ try {
   ];
   const uniqueKeywordRetryKeys = new Set(keywordRetryEntries.map((entry) => [entry.mutation.type, entry.mutation.payload.candidateId || entry.mutation.id].join(':')));
   assert.strictEqual(uniqueKeywordRetryKeys.size, 2, 'keyword retry metadata dedupes by candidate identity');
-  console.log('Slice 34/35/36/37/38/39/40/41/42/43/44/45/PackageD/AI Package 1B/Package 2/AI Task 3/AI Task 4/AI Task 5/AI Task 6/AI Task 8/AI Task 9/AI Task 10/AI Task 11/AI Task 12/AI Task 13/AI Task 14/AI Task 15/AI Task 16 checks passed at ' + tempRoot);
+  console.log('Slice 34/35/36/37/38/39/40/41/42/43/44/45/PackageD/AI Package 1B/Package 2/AI Task 3/AI Task 4/AI Task 5/AI Task 6/AI Task 8/AI Task 9/AI Task 10/AI Task 11/AI Task 12/AI Task 13/AI Task 14/AI Task 15/AI Task 16/AI Task 19/AI Task 20/AI Task 21/AI Task 23/AI Task 24 checks passed at ' + tempRoot);
 } finally {
   fs.rmSync(tempRoot, { recursive: true, force: true });
 }

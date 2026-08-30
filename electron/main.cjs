@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, screen, protocol, net, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, screen, protocol, net, dialog, safeStorage } = require('electron');
 const fs = require('fs');
 const path = require('path');
 const { pathToFileURL } = require('url');
@@ -9,6 +9,7 @@ const { allowedImageMimeTypes, maxRemoteImageBytes, maxRedirects, fetchTimeoutMs
 const { sanitizeExportFileName, fullDayBoundsError, exportPolicySummary } = require('./export-helpers.cjs');
 const { defaultProviderConfig, sanitizeProviderConfig, generateKeywordCandidates, keywordProviderState, validateKeywordProviderRequest, providerDiagnosticsFromConfig, providerErrorCodes } = require('./keyword-gateway.cjs');
 const { testProviderConnection } = require('./ai-provider-connectors.cjs');
+const { writeStoredQwenApiKey, clearStoredQwenApiKey, qwenRuntimeEnv, rendererSafeKeyStatus } = require('./api-key-store.cjs');
 const { validateImportPayload, mediaRefForImportItem, resolveImportMediaReferences: resolveImportMediaReferencesForIndex, matchedImportAsset } = require('./import-media-resolution.cjs');
 
 const stateFileName = 'workspace-state.json';
@@ -28,7 +29,8 @@ const profileDirectories = [
   'staging',
   'cache',
   'logs',
-  'exports'
+  'exports',
+  'secrets'
 ];
 let mainWindow = null;
 let workspaceState = {
@@ -39,6 +41,9 @@ let profileState = null;
 let mediaProtocolRegistered = false;
 let persistenceWorker = null;
 let mediaRelinkBatchPreview = null;
+let derivativeBuildActive = 0;
+const derivativeBuildQueue = [];
+const DERIVATIVE_BUILD_CONCURRENCY = 1;
 
 class PersistenceWorker {
   constructor(rootProvider) {
@@ -146,6 +151,44 @@ function writeKeywordProviderConfig(config) {
   return sanitized;
 }
 
+function providerRuntimeEnv() {
+  return qwenRuntimeEnv(profileRoot(), safeStorage, process.env);
+}
+
+function safeKeywordProviderState(config) {
+  return keywordProviderState(config, providerRuntimeEnv());
+}
+
+function providerKeyStatus() {
+  return { ok: true, qwen: rendererSafeKeyStatus(profileRoot(), safeStorage, process.env) };
+}
+
+async function importQwenApiKeyFromFile() {
+  const state = safeProfileState();
+  if (!state.ready) return { ok: false, error: state.error || 'Profile unavailable' };
+  const picked = await dialog.showOpenDialog(mainWindow, {
+    title: 'Choose Qwen API key file',
+    properties: ['openFile'],
+    filters: [{ name: 'Text file', extensions: ['txt', 'key', 'env'] }, { name: 'All files', extensions: ['*'] }]
+  });
+  if (picked.canceled || !picked.filePaths?.[0]) return { ok: false, canceled: true, keyStatus: rendererSafeKeyStatus(profileRoot(), safeStorage, process.env) };
+  const content = fs.readFileSync(picked.filePaths[0], 'utf8');
+  const keyLine = content.split(/\r?\n/).map((line) => line.trim()).find((line) => line && !line.startsWith('#')) || '';
+  const key = keyLine.includes('=') ? keyLine.split('=').slice(1).join('=').trim() : keyLine;
+  const result = writeStoredQwenApiKey(profileRoot(), key, safeStorage);
+  const config = readKeywordProviderConfig();
+  const keywordProvider = safeKeywordProviderState(config);
+  return { ...result, keyStatus: rendererSafeKeyStatus(profileRoot(), safeStorage, process.env), keywordProvider };
+}
+
+function clearQwenApiKey() {
+  const state = safeProfileState();
+  if (!state.ready) return { ok: false, error: state.error || 'Profile unavailable' };
+  const result = clearStoredQwenApiKey(profileRoot());
+  const config = readKeywordProviderConfig();
+  return { ...result, keyStatus: rendererSafeKeyStatus(profileRoot(), safeStorage, process.env), keywordProvider: safeKeywordProviderState(config) };
+}
+
 function updateKeywordProviderConfig(request = {}) {
   const current = readKeywordProviderConfig();
   const provider = String(request.provider || request.activeProvider || current.activeProvider || 'local-mock');
@@ -162,23 +205,25 @@ function updateKeywordProviderConfig(request = {}) {
     }
   };
   const saved = writeKeywordProviderConfig(patch);
-  return { ok: true, keywordProvider: keywordProviderState(saved), configPath: keywordProviderConfigPath() };
+  return { ok: true, keywordProvider: safeKeywordProviderState(saved), configPath: keywordProviderConfigPath(), keyStatus: rendererSafeKeyStatus(profileRoot(), safeStorage, process.env) };
 }
 
 function keywordProviderDiagnostics() {
   const config = readKeywordProviderConfig();
-  return { ok: true, diagnostics: providerDiagnosticsFromConfig(config), keywordProvider: keywordProviderState(config) };
+  const env = providerRuntimeEnv();
+  return { ok: true, diagnostics: providerDiagnosticsFromConfig(config, env), keywordProvider: keywordProviderState(config, env), keyStatus: rendererSafeKeyStatus(profileRoot(), safeStorage, process.env) };
 }
 
 async function testKeywordProvider(request = {}) {
   const config = readKeywordProviderConfig();
   const provider = String(request.provider || config.activeProvider || 'local-mock');
-  const diagnostics = providerDiagnosticsFromConfig(config);
+  const env = providerRuntimeEnv();
+  const diagnostics = providerDiagnosticsFromConfig(config, env);
   const validation = validateKeywordProviderRequest({ provider, providerConfig: config });
-  if (!validation.ok) return { ok: false, error: validation.error, diagnostics, keywordProvider: keywordProviderState(config) };
-  if (provider === 'local-mock') return { ok: true, provider, diagnostics, keywordProvider: keywordProviderState(config), message: 'Local mock is available. No network request was made.' };
-  const result = await testProviderConnection(provider, { providerConfig: config, profileRoot: profileRoot() });
-  return { ...result, diagnostics: result?.diagnostics || diagnostics, keywordProvider: keywordProviderState(config) };
+  if (!validation.ok) return { ok: false, error: validation.error, diagnostics, keywordProvider: keywordProviderState(config, env) };
+  if (provider === 'local-mock') return { ok: true, provider, diagnostics, keywordProvider: keywordProviderState(config, env), message: 'Local mock is available. No network request was made.' };
+  const result = await testProviderConnection(provider, { providerConfig: config, profileRoot: profileRoot(), env });
+  return { ...result, diagnostics: result?.diagnostics || diagnostics, keywordProvider: keywordProviderState(config, env) };
 }
 
 function dragHarnessLogPath() {
@@ -290,11 +335,20 @@ function visibleBounds(bounds) {
 }
 
 function scheduleDerivativeBuild(assetId) {
-  if (!assetId) return;
-  setTimeout(() => {
-    try { generateAssetDerivatives(profileRoot(), assetId); }
-    catch (error) { console.warn('media derivative build failed', error?.message || error); }
-  }, 0);
+  if (!assetId || derivativeBuildQueue.includes(assetId)) return;
+  derivativeBuildQueue.push(assetId);
+  drainDerivativeBuildQueue();
+}
+function drainDerivativeBuildQueue() {
+  while (derivativeBuildActive < DERIVATIVE_BUILD_CONCURRENCY && derivativeBuildQueue.length) {
+    const assetId = derivativeBuildQueue.shift();
+    derivativeBuildActive += 1;
+    setTimeout(() => {
+      try { generateAssetDerivatives(profileRoot(), assetId); }
+      catch (error) { console.warn('media derivative build failed', error?.message || error); }
+      finally { derivativeBuildActive = Math.max(0, derivativeBuildActive - 1); drainDerivativeBuildQueue(); }
+    }, 25);
+  }
 }
 
 function mediaRequestFromUrl(value) {
@@ -870,12 +924,15 @@ ipcMain.handle('export:capture-viewport-png', (_event, request) => captureViewpo
 ipcMain.handle('export:capture-full-day-png', (_event, request) => captureFullDayPng(request));
 ipcMain.handle('diagnostics:export-restore-fixture', (_event, request) => exportRestoreFixture(request));
 ipcMain.handle('backup:export-profile', (_event, request) => exportProfileBackup(request));
-ipcMain.handle('keyword:get-provider-state', () => keywordProviderState(readKeywordProviderConfig()));
+ipcMain.handle('keyword:get-provider-state', () => safeKeywordProviderState(readKeywordProviderConfig()));
+ipcMain.handle('keyword:get-key-status', () => providerKeyStatus());
+ipcMain.handle('keyword:import-qwen-key-file', () => importQwenApiKeyFromFile());
+ipcMain.handle('keyword:clear-qwen-key', () => clearQwenApiKey());
 ipcMain.handle('keyword:get-provider-diagnostics', () => keywordProviderDiagnostics());
 ipcMain.handle('keyword:set-provider-config', (_event, request) => updateKeywordProviderConfig(request));
 ipcMain.handle('keyword:test-provider', (_event, request) => testKeywordProvider(request));
 ipcMain.handle('keyword:validate-provider', (_event, request) => validateKeywordProviderRequest({ ...(request || {}), providerConfig: readKeywordProviderConfig() }));
-ipcMain.handle('keyword:generate', (_event, request) => generateKeywordCandidates({ ...(request || {}), providerConfig: readKeywordProviderConfig(), profileRoot: profileRoot() }));
+ipcMain.handle('keyword:generate', (_event, request) => generateKeywordCandidates({ ...(request || {}), providerConfig: readKeywordProviderConfig(), profileRoot: profileRoot(), env: providerRuntimeEnv() }));
 ipcMain.handle('media:relink-imported', (_event, request) => relinkImportedMedia(request));
 ipcMain.handle('media:preview-relink-batch', (_event, request) => previewMediaRelinkBatch(request));
 ipcMain.handle('media:apply-relink-batch', (_event, request) => applyMediaRelinkBatch(request));
