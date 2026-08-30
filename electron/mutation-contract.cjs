@@ -15,6 +15,7 @@ const allowedMutationTypes = new Set([
   'keyword.candidates',
   'keyword.accept',
   'keyword.dismiss',
+  'ai.job',
   'trash.move',
   'trash.restore',
   'trash.delete',

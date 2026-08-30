@@ -1,12 +1,12 @@
 ﻿# AestheticBoard Project Status
 
-> Last updated: 2026-08-29
+> Last updated: 2026-08-30
 > Current local branch: pr/slices-15-17
 > Latest PR: https://github.com/m2290882257-maker/AestheticBoard/pull/2
 
 ## Current Implementation State
 
-AestheticBoard has moved from a static vertical-slice prototype into a desktop-capable capture board with local profile persistence, recoverable media capture, SQLite-backed search, local export/import, durable retry metadata, full-day export, hardened remote capture policy, backup/restore UX, local-first AI keyword review, provider opt-in boundaries, keyword conflict detail, object-local and batch imported media repair, disabled external-provider consent surfaces, and polished Day / Weekly / Monthly navigation surfaces.
+AestheticBoard has moved from a static vertical-slice prototype into a desktop-capable capture board with local profile persistence, recoverable media capture, SQLite-backed search, local export/import, durable retry metadata, full-day export, hardened remote capture policy, backup/restore UX, local-first AI keyword review, provider opt-in boundaries, keyword conflict detail, object-local and batch imported media repair, disabled external-provider consent surfaces, polished Day / Weekly / Monthly navigation surfaces, a no-API real-provider connector scaffold behind the keyword gateway, the first Qwen real-provider adapter path with secrets kept outside renderer/source files, prompt-versioned AI output quality guards, and a current-day batch AI suggestion action.
 
 Implemented slices:
 
@@ -58,6 +58,31 @@ Implemented slices:
 | 44 | Done | Data & Privacy can scan a chosen folder, preview SHA-256 media matches, and apply confirmed batch relinks. |
 | 45 | Done | Provider capability/consent copy is visible while external provider settings remain disabled and unenforceable by mutation. |
 
+## Current Progress Sync - 2026-08-30 Evening
+
+The product is now past the core local-first board foundation and has entered the concrete AI keyword introduction stage.
+
+Completed or updated since the last status sync:
+
+- Day / Weekly / Monthly views now share the same navigation stack. Day opens the spatial canvas, Weekly opens seven date cards, and Monthly opens the month calendar; clicking a weekly or monthly date jumps back into that date's Day Canvas.
+- The right-side controls have been polished: date navigation uses the compact arrow / TODAY / arrow style, Day / Weekly / Monthly uses the segmented mode selector, and Reset View sits below the mode selector with matching spacing.
+- The left subtitle under the title now reflects the current mode: full date in Day mode, week range in Weekly mode, and month/year in Monthly mode.
+- More, Data & Privacy, Download / Share, Trash, and Search have been cleaned so they feel more like product surfaces and less like debug panels. Data & Privacy can scroll when content is tall, and middle-mouse canvas pan no longer fights with open panels.
+- Data & Privacy now owns local profile, backup/restore, media repair, AI privacy, and maintenance details. The duplicate standalone Profile panel has been removed.
+- Quick Note typing and font mapping have been repaired so notes use the intended handwriting-style note fonts instead of falling back to a generic UI font.
+- New image objects no longer receive fake default keyword placeholders. Real keywords now come from user actions or AI suggestions only.
+- Keyword hover and pin behavior has been refined: selected keywords show a hover tooltip with the full keyword, suggestion rows now only offer Accept and Dismiss, and pinning happens from the accepted keyword row's pin icon before the copy icon.
+- Qwen real-provider path is connected behind the existing keyword gateway. The renderer still never receives the API key; Electron main reads it from environment variables. GPT-5.7 Luna remains a disabled placeholder.
+- Qwen keyword generation now loads the runtime prompt from `docs/QWEN_KEYWORD_PROMPT.md` and sends the working image derivative plus limited object context through the existing provider connector.
+- Automatic AI keyword mode is available but off by default. It is session-only: leaving or hiding the window turns it off, while generated candidate keywords already saved on the board remain.
+- AI keyword output is now prompt-versioned and quality-guarded: empty output, malformed candidate shapes, unusable keyword text, timeout, and rate-limit failures remain object-local failures instead of becoming trusted keywords.
+- Data & Privacy now includes a current-day Generate day / Stop day AI control for batch suggestions across eligible Durable images. It queues only images without accepted/pinned keywords and throttles requests between images.
+- AI controls have been lifted from Data & Privacy into the More panel, so Qwen enable/off, Test connection, Auto keywords, and Generate day are one level closer to the user. Data & Privacy now keeps the privacy/model/prompt/access explanation without repeating the same controls.
+
+Plain-language current state:
+
+AestheticBoard can now be used as a local visual inspiration board with day/week/month browsing, reliable local persistence, import/export/backup tools, media repair paths, and a first real AI keyword provider route. The AI route is intentionally gated: users must explicitly enable Qwen and provide a key outside source code before any external keyword request can happen.
+
 ## 大白话 Slice 注释
 
 | Slice | 这一步是干嘛的 | 对产品有什么用 | 怎么简单测试 | 不做会怎样 |
@@ -87,11 +112,27 @@ Implemented slices:
 ## Verified Behaviors
 
 - `npm run check` passes through renderer, server, Electron main/preload, persistence, media-store, mutation, export, remote policy, keyword gateway, import media, and recovery checks.
-- The automated recovery script now reports `Slice 34/35/36/37/38/39/40/41/42/43/44/45 checks passed`.
+- The automated recovery script now reports `Slice 34/35/36/37/38/39/40/41/42/43/44/45/PackageD/AI Package 1B/Package 2/AI Task 3/AI Task 4/AI Task 5/AI Task 6/AI Task 8/AI Task 9/AI Task 10 checks passed`.
 - External AI provider requests are rejected by the keyword gateway unless a future explicit opt-in exists.
 - Missing imported media can stay visible as a local object with Relink file / Keep ref actions.
 - Relink validates SHA-256 when available and commits matched files into the same durable media pipeline as local captures.
 - Import, export, search, retry, and backup flows remain local-only and non-destructive by default.
+
+## Workspace Hygiene - 2026-08-30
+
+Current cleanup rule before continuing AI development:
+
+- Canonical product/design/engineering docs now live under `docs/`; the old root-level Markdown copies are treated as moved/de-duplicated, not as files to restore.
+- `PROJECT_STATUS.md` stays at the project root as the active progress ledger.
+- `不上传_开发文档/` is local source-discussion material and is ignored by Git so it does not enter PRs or distract status checks.
+- Temporary edit scripts matching `tmp-*.cjs` are ignored and should not remain in the workspace after edits.
+- `启动powershell帮助.md` has been repaired as clean UTF-8 Chinese and now documents normal launch, Qwen launch, provider smoke check, and the canonical docs location.
+- Local Git display is configured with `core.quotePath=false` so Chinese file names appear as readable Chinese instead of escaped byte sequences.
+
+Quick verification:
+
+- `cmd /c npm run check` should still pass after hygiene edits.
+- `git status --short` should no longer show `不上传_开发文档/` as untracked noise.
 
 ## Current Architecture Reality
 
@@ -101,7 +142,7 @@ Implemented slices:
 - Profile snapshot is stored as `workspace-snapshot.json`; mutation batches append to `logs/mutation-log.jsonl` and mirror into SQLite where possible.
 - Local, remote-localized, and relinked images render through `app-media://asset/<assetId>?variant=working` with original fallback.
 - Search is SQLite-backed in desktop, with renderer search as browser preview fallback.
-- External AI providers are defined only as disabled metadata. Local mock remains the only runnable keyword provider.
+- Qwen3.7 Flash is the first real-provider adapter path and stays off until local opt-in plus an API key are provided. It now loads `docs/QWEN_KEYWORD_PROMPT.md` as the runtime system/user prompt for real image keyword generation. AI candidates and jobs carry promptVersion, and bad provider output is rejected as local AI failure. GPT-5.7 Luna remains a disabled placeholder. Local mock remains the default runnable provider.
 
 ## Known Technical Debt
 
@@ -157,6 +198,15 @@ Implemented slices:
 - Previous / Today / Next keeps mode-aware behavior: day steps by one day, weekly steps by one week, monthly steps by one month.
 - Date navigator, mode selector, and Reset View now use a tighter right-side control stack.
 
+### AI Package 1: Real Provider Connector Scaffold - No Real API
+
+- Added a main-process provider connector module behind the existing keyword gateway.
+- Local mock still runs exactly as before and remains the default provider.
+- External provider jobs now have a formal job shape, durable-image checks, working-derivative checks, unified AI_PROVIDER error codes, and response schema validation.
+- This scaffold has now been extended by AI Package 1B so Qwen3.7 Flash can become the first real provider after explicit local opt-in and API key setup.
+- GPT-5.7 Luna remains a registered but disabled placeholder and cannot make network/API requests.
+- Automated checks cover disabled external provider enforcement, Qwen config sanitization, non-durable image rejection, response validation, candidate dedupe, and confidence clamping.
+
 ## Manual Test Checklist
 
 > Current note: most of this checklist has already been manually tested by the product owner and is considered passing for the current development stage. Keep it here as the lightweight baseline for later QA, packaging, and release prep. Do not expand Package A/C work until the main panels are complete.
@@ -208,105 +258,325 @@ Implemented slices:
 
 ### Privacy And Failure Boundaries
 
-- Confirm external AI provider settings remain disabled.
+- Confirm external AI is off by default; Qwen can run only after explicit Enable Qwen plus a valid environment API key.
 - Confirm local mock keyword generation does not make a cloud/API request.
 - Confirm unsafe remote URL targets stay blocked or become references instead of being fetched.
 - Confirm failed saves or capture failures stay local to the affected object/control and do not open a global modal.
 
-## Next Development Packages
+## AI Task 1 / 2 Progress - 2026-08-30
 
-Current priority can now move from panel cleanup into concrete AI introduction. The plan below is intentionally larger-grained than the earlier slices, but keeps the safety details that protect local-first data, user consent, and non-blocking board interaction.
+### AI Task 1: Confirm And Lock The Qwen Model
 
-### AI Package 1: Real Provider Connector Behind The Existing Gateway
+Status: Done for implementation, pending product-owner confirmation against the DashScope console model id.
 
-Goal: connect one real image-understanding provider without letting the renderer talk to the provider directly.
+What changed:
 
-Tasks for review:
+- Data & Privacy -> AI Privacy now shows the effective Qwen model, model source, Qwen key availability, key source, endpoint, and timeout.
+- The diagnostics path is read-only and never returns the API key value.
+- `AESTHETICBOARD_QWEN_MODEL` remains the highest-priority development override, followed by Profile provider config, then the built-in default `qwen3.7-flash`.
+- The same effective model value is used by the real Qwen request path and the diagnostics display.
+- `docs/AI_PROVIDER_SETUP.md` now documents where to confirm or override the actual Qwen model id.
 
-- Add a desktop-main AI connector that receives only approved keyword jobs from the existing keyword gateway.
-- Keep local mock as the default provider; real provider remains off until the user explicitly enables it in Data & Privacy.
-- Store provider config locally without exposing secrets to renderer UI code.
-- Validate provider responses before they can become keyword candidates.
-- Keep all AI failures object-local; failed AI never blocks capture, drag, note editing, search, export, or restart recovery.
+Plain-language value: the app now tells you what model it is actually about to call, instead of asking you to trust a label in the UI.
 
-Acceptance:
+### AI Task 2: Real Qwen Keyword Verification Pass
 
-- With provider disabled, the app behaves exactly like today and makes no external AI request.
-- With provider enabled, one image can produce candidate keywords through the same review UI as local mock.
-- Invalid provider output is shown as a local keyword failure, not written as trusted keywords.
+Status: Partially complete.
 
-### AI Package 2: Consent, Provider Settings, And Test Mode
+What changed:
 
-Goal: make AI activation understandable and reversible before any external data leaves the device.
+- Test connection now returns diagnostics together with the provider result.
+- Common Qwen provider failures still map into local object/provider states and do not become trusted keywords.
+- Full project checks cover diagnostics, environment override priority, API-key redaction, Qwen URL normalization, disabled GPT-5.7 Luna behavior, and missing-key handling.
 
-Tasks for review:
+Current verification result:
 
-- Upgrade Data & Privacy from disabled provider copy into a real opt-in settings surface.
-- Show what the provider can access: image working derivative, existing pinned keywords if allowed, no quick note by default.
-- Add a test connection action that does not send user board images.
-- Add a clear off switch that stops new AI jobs while preserving existing user-approved keywords.
-- Add local audit metadata for provider, consent version, job id, and timestamp.
+- `npm run check` passes.
+- `npm run check:provider:qwen` was attempted from this Codex environment and returned `AI_MISSING_API_KEY`, meaning this process cannot see `AESTHETICBOARD_QWEN_API_KEY` or `DASHSCOPE_API_KEY`.
+- The next real verification should be run from the same PowerShell session that launches the desktop app and contains the API key.
 
-Acceptance:
+Manual test next:
 
-- User can tell whether AI is mock/offline/external before pressing generate.
-- Turning AI off stops new external jobs and does not delete pinned keywords.
-- Test connection proves config works without uploading board content.
+1. Start desktop from the PowerShell session where the key is set.
+2. Open More -> Data & Privacy -> AI Privacy.
+3. Confirm Effective model shows `qwen3.7-flash` or your exact DashScope deployed model id.
+4. Confirm Qwen key shows Available.
+5. Click Test connection. This does not upload board images.
+6. Select one Durable image and click Suggest to run the first real image keyword request.
 
-### AI Package 3: Durable AI Job Queue And Retry
+## AI Task 3 / 4 Progress - 2026-08-30
 
-Goal: make real AI jobs survive restart and recover cleanly from network/provider errors.
+### AI Task 3: AI Provider Status Copy And User Controls Polish
 
-Tasks for review:
+Status: Done for first pass.
 
-- Persist AI job states separately from image capture states: queued, uploading, waiting, succeeded, failed, canceled.
-- Dedupe AI jobs by image asset, provider, prompt version, and locale so retries do not spam duplicates.
-- Add object-local retry/cancel controls for failed or pending AI jobs.
-- Keep generated candidates separate from pinned keywords until the user accepts them.
-- Ensure search indexes only ACKed pinned/accepted keywords first.
+What changed:
 
-Acceptance:
+- AI Privacy now explains the current mode in plain product language: local/off versus Qwen enabled.
+- The panel shows provider, effective model, image access, text access, network access, auto keyword state, session rule, and AI job counts.
+- The off action is clearer: `Turn AI off` switches back to local mock and stops new external jobs while keeping accepted keywords.
+- Test connection copy clarifies that it is text-only and does not upload board images.
+- GPT-5.7 Luna remains visible only as a disabled future provider in the capability list.
 
-- Killing the app during an AI job does not corrupt the board or duplicate image objects.
-- Restart restores pending/failed AI job state on the affected image.
-- Retrying AI does not duplicate candidates or overwrite user-pinned keywords.
+### AI Task 4: Durable AI Job Queue
 
-### AI Package 4: Prompt Contract, Output Quality, And Safety Fixtures
+Status: Done for first pass.
 
-Goal: make AI keyword output useful for aesthetic retrieval while staying schema-bound.
+What changed:
 
-Tasks for review:
+- AI jobs are now recorded in board state and persisted through the existing ACK-backed snapshot path.
+- Jobs track queued, sending, waiting, succeeded, failed, and canceled states.
+- Jobs are deduped by object/media, provider, model, prompt version, and locale so retry does not create duplicate work for the same image.
+- Restart recovery restores AI job state and re-marks affected images as pending or failed where appropriate.
+- Image keyword panels now expose object-local Retry AI and Cancel actions for failed/pending jobs.
+- Accepted/pinned keywords remain separate from unreviewed candidates and search stays tied to accepted/pinned keywords.
 
-- Implement the SystemPrompt contract as versioned prompt metadata, not loose renderer text.
-- Require structured keyword candidates with dimension/type, confidence, provider, and source timestamp.
-- Add fixtures for malformed JSON, unsafe content, empty result, timeout, and duplicate keywords.
-- Add lightweight quality checks for duplicate words, overly generic labels, and missing dimensions.
-- Keep prompt/version changes visible in local metadata for later debugging.
+Manual test next:
 
-Acceptance:
+1. Open More -> Data & Privacy -> AI Privacy and confirm the rows read like product status, not raw debug output.
+2. Enable Qwen, confirm image/text/network rows switch on, then click Turn AI off and confirm they switch back off.
+3. On a Durable image, click Suggest and confirm the local keyword panel shows sending/waiting/failure states locally on that image.
+4. If a job fails, use Retry AI; if a job is pending, use Cancel.
+5. Restart desktop after a failed AI request and confirm the affected image still shows the failed AI state instead of losing it.
 
-- Provider output cannot enter the board unless it passes schema validation.
-- Bad AI responses stay inspectable as failed candidate state.
-- Prompt version is visible enough to explain why a set of candidates was generated.
+## AI Task 5 / 6 Progress - 2026-08-30
 
-### AI Package 5: Batch Suggestions Without Auto-Organizing The Board
+### AI Task 5: Prompt Version And Output Quality Guard
 
-Goal: speed up keyword creation for many images while keeping user spatial layout untouched.
+Status: Done for first pass.
 
-Tasks for review:
+What changed:
 
-- Add a selected-day action to queue suggestions for images without accepted keywords.
-- Throttle jobs and show per-object progress instead of a global blocking modal.
-- Let users review candidates object by object; no automatic pinning or board rearrangement.
-- Add a stop/pause action for newly queued batch jobs.
-- Keep export/import/backup aware of AI job and candidate metadata.
+- AI jobs and candidate keyword sets now carry promptVersion, so future prompt changes can be traced back to generated keywords.
+- Provider responses are checked for empty output, unsupported candidate shape, unusable or overlong keyword text, duplicate terms, confidence values, and language fields.
+- Duplicate usable terms are deduped and tracked in quality metadata.
+- Fully bad output is rejected as an object-local AI failure instead of being saved as trusted keywords.
+- Timeout and rate-limit failures remain local AI states and do not block capture, notes, manual keywords, search, export, or board movement.
 
-Acceptance:
+Manual test:
 
-- Batch AI never moves, resizes, groups, sorts, or hides board objects.
-- User can keep working while suggestions run.
-- Stopping batch jobs preserves completed candidate results and marks the rest as canceled or queued.
+1. Enable Qwen and select a Durable image.
+2. Click Suggest and confirm candidates appear with normal Accept / Dismiss review.
+3. If Qwen returns bad output, confirm the image shows a local AI failure and does not add broken keywords.
+4. Accept one keyword and confirm search finds it only after it becomes an accepted/pinned keyword.
 
-## Review Request
+### AI Task 6: Batch AI Suggestions For Current Day
 
-Please review the AI package order above before implementation. Recommended order is AI Package 1 -> 2 -> 3 -> 4 -> 5, because the provider connector should stay behind the existing gateway, then consent/settings, then durable job reliability, then prompt hardening, then batch speed-up.
+Status: Done for first pass.
+
+What changed:
+
+- Data & Privacy -> AI Privacy now has Generate day for current-day batch suggestions.
+- The batch only queues current-day Durable images that do not already have accepted or pinned keywords.
+- Requests run one by one with a short delay between images so Qwen is not spammed.
+- Each image keeps its own pending, success, failed, retry, and cancel state.
+- Stop day AI stops unfinished work while preserving candidates already generated.
+
+Manual test:
+
+1. Enable Qwen from Data & Privacy.
+2. Add several Durable images without keywords to the same day.
+3. Click Generate day and confirm images are processed one by one.
+4. Click Stop day AI mid-run and confirm unfinished images do not start, while completed candidates remain.
+
+## AI Task 7 / 8 Progress - 2026-08-30
+
+### AI Task 7: Real Qwen Smoke Test From Desktop Session
+
+Status: Code path ready; real API verification still needs the PowerShell/Electron session that can see the user's Qwen key.
+
+What changed / verified:
+
+- The provider diagnostics path now reports Qwen provider id, effective model, endpoint, timeout, key availability, key source, and prompt version without exposing the key value.
+- The local smoke command reached the Qwen connector, but this Codex process reported `AI_MISSING_API_KEY`, meaning it cannot see the API key that was set in the user's separate PowerShell session.
+- This confirms missing-key failures stay local and do not send any board image.
+
+Manual continuation:
+
+1. In the same PowerShell window where the key is set, run `cmd /c npm start`.
+2. Open More -> Data & Privacy -> AI Privacy.
+3. Confirm Qwen key says Available, model says the intended DashScope model id, and prompt version is visible.
+4. Click Test connection. This should not upload a board image.
+5. Select a Durable image and click Suggest. Record whether Qwen returns candidate keywords or whether DashScope rejects the configured model id.
+
+### AI Task 8: Prompt Contract Lock And Visible Version
+
+Status: Done for first pass.
+
+What changed:
+
+- The Qwen connector now reads the version from `docs/QWEN_KEYWORD_PROMPT.md` when the file has `**Version:** ...`, `version: ...`, `promptVersion: ...`, or JSON-style `promptVersion` metadata.
+- If the prompt file has no explicit version, the connector falls back to the built-in prompt version instead of crashing.
+- Data & Privacy -> AI Privacy now shows Prompt / Prompt version alongside Provider and Model.
+- Object-local AI failure details now include the prompt version in the hover detail, so a failed generation can be traced back to the prompt contract.
+- `docs/AI_PROVIDER_SETUP.md` now includes a prompt-file checklist.
+
+Manual test checklist:
+
+1. Open Data & Privacy -> AI Privacy and confirm Provider, Model, and Prompt are shown together.
+2. Edit only the version line in `docs/QWEN_KEYWORD_PROMPT.md`, restart the app, and confirm the displayed prompt version changes.
+3. Trigger an AI failure such as missing key; hover the local failure message and confirm Error / Provider / Prompt details are visible.
+
+## AI Task 9 / 10 Progress - 2026-08-30
+
+### AI Task 9: AI Candidate Review Polish
+
+Status: Done for first pass.
+
+What changed:
+
+- AI candidate rows keep only Accept and Dismiss actions. Pin remains on accepted keyword rows before Copy.
+- Long candidate keywords keep the compact row layout but expand on hover so the full phrase can be read.
+- Candidate hover details include the full keyword, Chinese translation when present, provider/source, prompt version, and confidence.
+- Candidate metadata is shown as a quiet compact detail line, not a large debug block.
+- Added Dismiss all for the current image's unreviewed suggestions. It does not remove accepted or pinned keywords.
+
+Manual test checklist:
+
+1. Generate AI suggestions with at least one long keyword.
+2. Hover the candidate text and confirm the full keyword can be read.
+3. Confirm each candidate row only has Accept and Dismiss.
+4. Accept one candidate, then confirm pinning is done from the accepted keyword row's pin icon.
+5. Click Dismiss all and confirm accepted/pinned keywords remain.
+
+### AI Task 10: Batch Queue UX Feedback
+
+Status: Done for first pass.
+
+What changed:
+
+- Generate day now tracks current-day batch progress with total, completed, failed, skipped, and stopped state.
+- More -> AI Keywords shows the batch queue as ready, running, stopped, or done with counts.
+- While Generate day is running, the currently processed image is marked locally on the canvas and its keyword panel title changes to Generating for day.
+- Stop day AI remains visible while the batch is active and stops unfinished work without clearing completed suggestions.
+- Batch progress stays inside More/object-local panels and does not use global modals.
+
+Manual test checklist:
+
+1. Enable Qwen and place several Durable images without accepted keywords on the current day.
+2. Open More -> AI Keywords and confirm Queue shows how many are ready.
+3. Click Generate day and confirm Queue changes to progress such as 1 / 3 done.
+4. Watch the active image: it should show a local batch/current processing state.
+5. Click Stop day AI and confirm completed suggestions remain while unfinished images stop.
+
+### AI Task 11: Durable AI Job Recovery Upgrade
+
+Status: Done for first pass.
+
+What changed:
+
+- AI jobs that were queued, sending, or waiting during app close/reload are converted on launch into a recoverable failed state with the message `AI was interrupted`.
+- Restart recovery dedupes AI jobs by object id, asset id, provider, model, prompt version, and locale so retries reuse the same image context instead of creating duplicate candidates.
+- Canceled AI jobs stay canceled and are not auto-restarted.
+- The affected image keeps its local failed/interrupted state and exposes Retry AI / Cancel actions from the object keyword panel.
+- The automated recovery/export check now confirms the interrupted-job recovery helper and explicit interruption copy are present.
+
+Manual test checklist:
+
+1. Start a Suggest or Generate day job.
+2. Close or reload the desktop app while the job is queued/sending/waiting.
+3. Reopen the same day and image. It should show `AI was interrupted`, not an endless pending state.
+4. Click Retry AI and confirm the same image is reused; no duplicate board object should appear.
+5. Cancel a failed/interrupted job and restart. It should not auto-run again.
+
+### AI Task 12: Provider Error Copy And Troubleshooting
+
+Status: Done for first pass.
+
+What changed:
+
+- Qwen HTTP failures are now split into missing key, rejected key, model not found, timeout, rate limit, malformed output, working image missing, and network failure paths.
+- Image-local AI failures show friendly copy first, while the raw error code remains available in hover/detail text.
+- Data & Privacy -> AI Privacy includes a short setup/troubleshooting hint so the user knows where to fix key/model/network issues.
+- `docs/AI_PROVIDER_SETUP.md` now has a troubleshooting map for common Qwen errors.
+
+Manual test checklist:
+
+1. Enable Qwen without an API key and run Test connection. It should say the Qwen API key needs to be added.
+2. Use a deliberately bad key and run Test connection. It should say the API key was rejected.
+3. Use a deliberately wrong `AESTHETICBOARD_QWEN_MODEL` and run Test connection. It should point to the Qwen model name.
+4. Trigger malformed output during development and confirm the image says provider output format failed, not network failed.
+5. Hover the local failure text and confirm the raw error code is still available for debugging.
+
+### AI Task 13: Accepted AI Keyword Search Confirmation
+
+Status: Done for first pass.
+
+What changed:
+
+- SQLite search now indexes manual keywords plus AI candidates whose review state is `accepted`.
+- Suggested and dismissed AI candidates are deliberately excluded from the durable search haystack.
+- The search behavior is ACK-backed because the SQLite index is rebuilt from the saved snapshot after persistence writes.
+- The automated recovery/export check now covers accepted-only AI candidate indexing and confirms suggested/dismissed candidates remain invisible to search.
+
+Manual test checklist:
+
+1. Generate AI suggestions on a Durable image.
+2. Search for one unreviewed suggestion before accepting it; it should not appear as trusted search metadata.
+3. Accept or pin that suggestion, wait for Saved, then search again; it should appear.
+4. Dismiss another suggestion, wait for Saved, and confirm search does not find it.
+5. Restart desktop and repeat the search to confirm the same accepted-only behavior remains.
+
+### AI Task 14: API Key Handling Upgrade Decision
+
+Status: Done as a product/engineering decision for the current development stage.
+
+Decision:
+
+- Keep environment variables as the only supported API-key input for current development and internal testing.
+- Do not add a renderer API-key field yet. The renderer can only see a safe status shape: provider id, available/missing, source, and `secretVisibleToRenderer: false`.
+- Do not put API keys in source files, Profile JSON, exported JSON, backups, logs, screenshots, or Markdown docs.
+- Move to OS credential storage later, before packaging or broader user testing, when the settings flow is stable enough to justify a real secret-management UI.
+
+What changed:
+
+- Added a provider key status helper that reports key availability/source without returning the secret value.
+- Added an automated check that intentionally passes a fake secret and confirms it never appears in renderer-safe diagnostics.
+- Updated local setup notes in the `docs/` folder; docs-folder changes are intentionally excluded from this PR.
+
+Manual test checklist:
+
+1. Start desktop without a Qwen key. Data & Privacy should show Qwen key as Not set.
+2. Start desktop from a PowerShell session with `AESTHETICBOARD_QWEN_API_KEY`. Data & Privacy should show Available, never the key value.
+3. Export JSON or backup and confirm no API key value appears.
+4. Use the key only through PowerShell/env vars for now; do not paste it into repo files.
+
+### AI Task 15: AI Manual QA Checklist And Demo Script
+
+Status: Done for first pass.
+
+What changed:
+
+- Maintained the repeatable AI manual test checklist and review demo script in the local `docs/` folder; docs-folder changes are intentionally excluded from this PR.
+- Project Status now records the short QA path for Enable Qwen, Test connection, Suggest, Retry AI, Cancel, Generate day, Stop day AI, Accept, Dismiss, Pin, Search, restart recovery, and Turn AI off.
+- The checklist clearly separates no-network checks from real-Qwen checks that require an API key.
+- No step asks the user to expose, paste into source, or screenshot the real API key.
+
+Manual QA path:
+
+1. Open More and confirm AI starts Off / local.
+2. Enable Qwen only from the desktop session that has the key.
+3. Run Test connection, then Suggest on one Durable image.
+4. Retry or Cancel local failures from the affected image.
+5. Run Generate day, watch progress, then Stop day AI.
+6. Accept, Dismiss, and Pin suggestions.
+7. Search accepted/pinned terms and confirm dismissed/unreviewed terms stay out.
+8. Restart, confirm recovery state, then Turn AI off.
+
+### AI Task 16: Next Provider Placeholder Boundaries
+
+Status: Done for first pass.
+
+What changed:
+
+- GPT-5.7 Luna remains registered so the future provider direction is visible, but it is marked future-only / not connected in the provider capability list.
+- Disabled providers can no longer become the active provider through stale local config; they fall back to local mock.
+- Validation still rejects direct GPT-5.7 Luna requests as disabled, even if a stale config tries to opt into external/network access.
+- Automated checks confirm GPT-5.7 Luna cannot enable external AI, cannot enable network access, and cannot reach the keyword generation path.
+
+Manual test checklist:
+
+1. Open Data & Privacy -> AI Privacy. GPT-5.7 Luna should read as future-only / not connected yet.
+2. Confirm there is no usable GPT-5.7 Luna enable button in More.
+3. Keep Qwen behavior unchanged: Enable Qwen / Turn AI off should still only affect Qwen/local mock.
+4. If a stale Profile config names GPT-5.7 Luna, app state should fall back to local mock instead of trying a network call.

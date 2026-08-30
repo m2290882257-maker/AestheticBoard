@@ -35,6 +35,9 @@ contextBridge.exposeInMainWorld('aestheticBoardShell', {
   exportRestoreFixture: (request) => ipcRenderer.invoke('diagnostics:export-restore-fixture', { snapshot: request?.snapshot && typeof request.snapshot === 'object' ? request.snapshot : null }),
   exportProfileBackup: (request) => ipcRenderer.invoke('backup:export-profile', { snapshot: request?.snapshot && typeof request.snapshot === 'object' ? request.snapshot : null }),
   getKeywordProviderState: () => ipcRenderer.invoke('keyword:get-provider-state'),
+  getKeywordProviderDiagnostics: () => ipcRenderer.invoke('keyword:get-provider-diagnostics'),
+  setKeywordProviderConfig: (request) => ipcRenderer.invoke('keyword:set-provider-config', request && typeof request === 'object' ? request : {}),
+  testKeywordProvider: (request) => ipcRenderer.invoke('keyword:test-provider', request && typeof request === 'object' ? request : {}),
   validateKeywordProvider: (request) => ipcRenderer.invoke('keyword:validate-provider', request && typeof request === 'object' ? request : {}),
   generateKeywordCandidates: (request) => ipcRenderer.invoke('keyword:generate', request && typeof request === 'object' ? request : {}),
   verifyRestoreProfile: () => ipcRenderer.invoke('diagnostics:verify-restore-profile')

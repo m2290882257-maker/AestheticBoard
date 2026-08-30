@@ -264,6 +264,23 @@ function cleanPreview(value, limit = 120) {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, limit);
 }
 
+function approvedKeywordTexts(item = {}) {
+  const seen = new Set();
+  const values = [];
+  const add = (value) => {
+    const text = String(value || '').trim();
+    const key = text.toLowerCase();
+    if (!text || seen.has(key)) return;
+    seen.add(key);
+    values.push(text);
+  };
+  (Array.isArray(item.keywords) ? item.keywords : []).forEach(add);
+  (Array.isArray(item.keywordCandidates) ? item.keywordCandidates : [])
+    .filter((candidate) => candidate && candidate.state === 'accepted')
+    .forEach((candidate) => add(candidate.text || candidate.keyword || candidate.en));
+  return values;
+}
+
 function linkTitleFromUrl(value) {
   try {
     const url = new URL(String(value || ''));
@@ -282,9 +299,10 @@ function searchRowsFromSnapshot(snapshot) {
     (board?.items || []).forEach((item) => {
       const kind = item.kind || 'image';
       const url = item.url || item.sourceUrl || '';
-      const title = kind === 'link' ? (item.label || linkTitleFromUrl(url)) : ((item.keywords || [])[0] || 'Image');
-      const preview = kind === 'link' ? [hostFromUrl(url), item.note].filter(Boolean).join(' - ') : [item.note, (item.keywords || []).slice(1, 3).join(', ')].filter(Boolean).join(' - ');
-      rows.push({ id: String(item.id || item.captureJobId || ('object:' + rows.length)), dayCanvasId: dayId, objectId: String(item.id || ''), type: kind, title, preview: cleanPreview(preview, 140), capturedAtUtc: String(item.capturedAtUtc || item.capturedAt || item.createdAtUtc || ''), haystack: normalizeSearchText([kind, item.sourceType || '', item.label || '', url, hostFromUrl(url), item.note || '', (item.keywords || []).join(' '), item.capturedAtUtc || item.capturedAt || item.createdAtUtc || '', dayId, board.title || '', formatSearchDate(dayId)].join(' ')) });
+      const approvedKeywords = approvedKeywordTexts(item);
+      const title = kind === 'link' ? (item.label || linkTitleFromUrl(url)) : (approvedKeywords[0] || 'Image');
+      const preview = kind === 'link' ? [hostFromUrl(url), item.note].filter(Boolean).join(' - ') : [item.note, approvedKeywords.slice(1, 3).join(', ')].filter(Boolean).join(' - ');
+      rows.push({ id: String(item.id || item.captureJobId || ('object:' + rows.length)), dayCanvasId: dayId, objectId: String(item.id || ''), type: kind, title, preview: cleanPreview(preview, 140), capturedAtUtc: String(item.capturedAtUtc || item.capturedAt || item.createdAtUtc || ''), haystack: normalizeSearchText([kind, item.sourceType || '', item.label || '', url, hostFromUrl(url), item.note || '', approvedKeywords.join(' '), item.capturedAtUtc || item.capturedAt || item.createdAtUtc || '', dayId, board.title || '', formatSearchDate(dayId)].join(' ')) });
     });
   });
   return rows;
@@ -425,4 +443,4 @@ function loadWorkspaceSnapshot(profileRoot) {
     db.close();
   }
 }
-module.exports = { ensureMetadataStore, insertDurableCapture, saveWorkspaceSnapshot, loadWorkspaceSnapshot, rebuildSearchIndex, querySearchIndex, writeRetryQueue, readRetryQueue, schemaVersion };
+module.exports = { ensureMetadataStore, insertDurableCapture, saveWorkspaceSnapshot, loadWorkspaceSnapshot, rebuildSearchIndex, querySearchIndex, writeRetryQueue, readRetryQueue, approvedKeywordTexts, schemaVersion };

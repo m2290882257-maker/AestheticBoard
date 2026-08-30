@@ -1129,12 +1129,7 @@
 }
 
 .ai-keyword-candidate > span:first-child {
-  overflow: hidden;
-  color: var(--text-primary);
-  font-size: 12px;
-  line-height: 16px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  min-width: 0;
 }
 
 .ai-keyword-actions {
@@ -1826,4 +1821,211 @@
     min-width: 42px;
     padding: 0 7px;
   }
+}
+
+
+.ai-provider-settings {
+  display: grid;
+  gap: 8px;
+  padding: 9px;
+  border: 1px solid rgb(54 51 44 / 10%);
+  border-radius: var(--radius-md);
+  background: rgb(255 255 255 / 36%);
+}
+
+.ai-provider-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.ai-provider-head strong {
+  color: var(--text-primary);
+  font-size: 12px;
+  line-height: 16px;
+  font-weight: 650;
+}
+
+.ai-provider-head span {
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  background: rgb(82 118 90 / 10%);
+  color: var(--human-green);
+  font-size: 10px;
+  line-height: 14px;
+  font-weight: 600;
+}
+
+.ai-provider-settings p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.ai-provider-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 5px;
+}
+
+.ai-provider-actions button {
+  justify-content: center;
+  min-width: 0;
+  min-height: 30px;
+  padding: 0 6px;
+  border-radius: var(--radius-sm);
+  background: rgb(73 108 136 / 8%);
+  color: var(--human-blue);
+  font-size: 11px;
+  line-height: 14px;
+  text-align: center;
+}
+
+.ai-provider-actions button:nth-child(2) {
+  background: rgb(54 51 44 / 6%);
+  color: var(--text-secondary);
+}
+
+.ai-provider-actions button:disabled {
+  cursor: default;
+  opacity: .52;
+}
+
+.ai-provider-hint {
+  color: var(--text-muted);
+}
+
+.keyword-empty-state {
+  padding: 5px 6px;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 15px;
+  font-style: italic;
+}
+
+/* Quick note editor typography */
+.note-editor,
+.note-editor::placeholder {
+  font-family: var(--font-personal-zh), var(--font-personal-en);
+  font-size: var(--type-note-size);
+  line-height: var(--quick-note-line-height);
+  font-weight: 400;
+  letter-spacing: 0;
+}
+
+.note-editor::placeholder {
+  color: rgb(83 80 71 / 52%);
+}
+
+
+/* AI job local controls */
+.ai-job-actions {
+  display: flex;
+  gap: 4px;
+}
+
+.ai-job-actions button {
+  min-height: 24px;
+  padding: 0 7px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: rgb(73 108 136 / 9%);
+  color: var(--human-blue);
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 15px;
+}
+
+.ai-job-actions button:last-child {
+  background: rgb(54 51 44 / 7%);
+  color: var(--text-secondary);
+}
+
+.ai-keyword-head {
+  grid-template-columns: minmax(0, 1fr) auto auto;
+}
+
+.ai-more-controls {
+  min-width: 292px;
+  padding: 8px;
+  background: rgb(255 255 255 / 30%);
+}
+
+.ai-more-controls .profile-detail-list {
+  gap: 3px;
+}
+
+.ai-more-controls .profile-detail-row {
+  grid-template-columns: 58px minmax(0, 1fr);
+  min-height: 20px;
+  font-size: 11px;
+  line-height: 15px;
+}
+
+.ai-more-controls .ai-provider-actions {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.ai-more-controls .ai-provider-actions button:first-child {
+  background: rgb(82 118 90 / 13%);
+  color: var(--human-green);
+}
+
+.ai-more-controls.qwen-enabled .ai-provider-actions button:first-child {
+  background: rgb(54 51 44 / 6%);
+  color: var(--text-secondary);
+}
+
+.ai-candidate-copy {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.ai-candidate-text {
+  overflow: hidden;
+  color: var(--text-primary);
+  font-size: 12px;
+  line-height: 16px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ai-candidate-copy:hover .ai-candidate-text {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.ai-candidate-detail {
+  overflow: hidden;
+  color: rgb(83 80 71 / 68%);
+  font-size: 10px;
+  line-height: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ai-dismiss-all {
+  justify-self: end;
+  min-height: 22px;
+  padding: 0 7px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: rgb(54 51 44 / 6%);
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 14px;
+}
+
+.ai-batch-current .image-frame {
+  box-shadow: 0 0 0 1px rgb(82 118 90 / 62%), 0 8px 22px rgb(82 118 90 / 12%);
+}
+
+.ai-batch-current .capture-state {
+  display: block;
+  border-color: rgb(82 118 90 / 28%);
+  color: var(--human-green);
 }

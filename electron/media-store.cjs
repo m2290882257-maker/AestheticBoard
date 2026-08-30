@@ -86,6 +86,29 @@ function generateDerivative(profileRoot, originalPath, sha256, variant) {
     return fileRecord(relpath, 'image/png', variant, 'failed', { errorCode: error?.message || 'DERIVATIVE_FAILED' });
   }
 }
+function pendingDerivativeRecord(sha256, variant, existing = {}) {
+  const spec = derivativeSpecs[variant];
+  const relpath = existing.relpath || portablePath('media', spec.folder, sha256 + '-' + variant + '.png');
+  return fileRecord(relpath, 'image/png', variant, existing.state === 'ready' ? 'ready' : 'pending', {
+    byteLength: existing.byteLength || 0,
+    width: existing.width || 0,
+    height: existing.height || 0,
+    errorCode: existing.errorCode || ''
+  });
+}
+function buildFastVariantRecords(profileRoot, asset) {
+  const originalStat = safeFileStat(profileRoot, asset.originalRelpath);
+  const variants = {
+    ...(asset.variants || {}),
+    original: fileRecord(asset.originalRelpath, asset.mime || asset.original_mime || 'application/octet-stream', 'original', originalStat ? 'ready' : 'missing', { byteLength: originalStat?.size || asset.byteLength || 0 })
+  };
+  Object.keys(derivativeSpecs).forEach((variant) => {
+    const existing = variants[variant];
+    if (existing?.state === 'ready' && existing.relpath && fs.existsSync(path.join(profileRoot, existing.relpath))) return;
+    variants[variant] = pendingDerivativeRecord(asset.sha256, variant, existing || {});
+  });
+  return variants;
+}
 function buildVariantRecords(profileRoot, asset) {
   const originalStat = safeFileStat(profileRoot, asset.originalRelpath);
   const variants = {
@@ -192,6 +215,16 @@ function repairMediaIndex(profileRoot) {
   });
   writeMediaIndex(profileRoot, index);
   return { ok: true, originals, workingReady, thumbnailReady, derivativeFailed, updatedAtUtc: nowIso() };
+}
+function generateAssetDerivatives(profileRoot, assetId) {
+  const index = readMediaIndex(profileRoot);
+  const asset = index.assets[String(assetId || '')];
+  if (!asset) return { ok: false, error: 'MEDIA_ASSET_NOT_FOUND' };
+  asset.variants = buildVariantRecords(profileRoot, asset);
+  asset.updatedAtUtc = nowIso();
+  index.assets[asset.assetId] = asset;
+  writeMediaIndex(profileRoot, index);
+  return { ok: true, assetId: asset.assetId, variants: asset.variants, updatedAtUtc: asset.updatedAtUtc };
 }
 function recoverCaptureJobs(profileRoot) {
   const queue = readCaptureJobs(profileRoot);
@@ -311,7 +344,7 @@ function commitImageBytes(profileRoot, bytes, declaredMime, request) {
     createdAtUtc: previous.createdAtUtc || nowIso(),
     updatedAtUtc: nowIso()
   };
-  asset.variants = buildVariantRecords(profileRoot, asset);
+  asset.variants = buildFastVariantRecords(profileRoot, asset);
   index.assets[assetId] = asset;
   writeMediaIndex(profileRoot, index);
   const rendererSrc = assetUrl(assetId, 'working');
@@ -377,4 +410,4 @@ function resolveAssetPath(profileRoot, assetId, variant = 'original') {
   return { fullPath, mime: selected.mime || asset.mime || 'application/octet-stream', variant: selected.role || 'original', requestedVariant: requested, fallback: selected !== candidate };
 }
 
-module.exports = { commitDataUrl, commitFilePath, previewRelinkFolder, commitRelinkMatches, resolveAssetPath, readCaptureJobs, updateCaptureJob, recoverCaptureJobs, repairMediaIndex, readMediaIndex };
+module.exports = { commitDataUrl, commitFilePath, previewRelinkFolder, commitRelinkMatches, resolveAssetPath, readCaptureJobs, updateCaptureJob, recoverCaptureJobs, repairMediaIndex, generateAssetDerivatives, readMediaIndex };

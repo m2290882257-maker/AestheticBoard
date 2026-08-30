@@ -3,11 +3,12 @@ const fs = require('fs');
 const path = require('path');
 const { pathToFileURL } = require('url');
 const { ensureMetadataStore, insertDurableCapture, saveWorkspaceSnapshot, loadWorkspaceSnapshot, rebuildSearchIndex, querySearchIndex, writeRetryQueue, readRetryQueue } = require('./persistence.cjs');
-const { commitDataUrl, commitFilePath, previewRelinkFolder, commitRelinkMatches, resolveAssetPath, recoverCaptureJobs, repairMediaIndex, readCaptureJobs, readMediaIndex } = require('./media-store.cjs');
+const { commitDataUrl, commitFilePath, previewRelinkFolder, commitRelinkMatches, resolveAssetPath, recoverCaptureJobs, repairMediaIndex, generateAssetDerivatives, readCaptureJobs, readMediaIndex } = require('./media-store.cjs');
 const { validatePersistenceEnvelope } = require('./mutation-contract.cjs');
 const { allowedImageMimeTypes, maxRemoteImageBytes, maxRedirects, fetchTimeoutMs, validateRemoteImageUrl, assertRemoteHostAllowed, mimeFromResponse, detectRemoteImageInfo, assertImageSizeAllowed, policySummary } = require('./remote-policy.cjs');
 const { sanitizeExportFileName, fullDayBoundsError, exportPolicySummary } = require('./export-helpers.cjs');
-const { defaultProviderConfig, sanitizeProviderConfig, generateKeywordCandidates, keywordProviderState, validateKeywordProviderRequest } = require('./keyword-gateway.cjs');
+const { defaultProviderConfig, sanitizeProviderConfig, generateKeywordCandidates, keywordProviderState, validateKeywordProviderRequest, providerDiagnosticsFromConfig, providerErrorCodes } = require('./keyword-gateway.cjs');
+const { testProviderConnection } = require('./ai-provider-connectors.cjs');
 const { validateImportPayload, mediaRefForImportItem, resolveImportMediaReferences: resolveImportMediaReferencesForIndex, matchedImportAsset } = require('./import-media-resolution.cjs');
 
 const stateFileName = 'workspace-state.json';
@@ -107,13 +108,35 @@ function keywordProviderConfigPath() {
   return path.join(profileRoot(), 'keyword-provider-config.json');
 }
 
+function truthyEnv(value) {
+  return ['1', 'true', 'yes', 'on'].includes(String(value || '').trim().toLowerCase());
+}
+
+function providerConfigWithEnvironment(config) {
+  const patch = { ...(config || {}) };
+  const provider = process.env.AESTHETICBOARD_AI_PROVIDER;
+  if (provider) patch.activeProvider = provider;
+  if (truthyEnv(process.env.AESTHETICBOARD_EXTERNAL_AI_ENABLED)) {
+    patch.externalProviderEnabled = true;
+    patch.allowImageAccess = true;
+    patch.allowTextAccess = true;
+    patch.allowNetwork = true;
+  }
+  const qwenOptions = { ...((patch.providerOptions || {})['qwen3.7-flash'] || {}) };
+  if (process.env.AESTHETICBOARD_QWEN_MODEL) qwenOptions.model = process.env.AESTHETICBOARD_QWEN_MODEL;
+  if (process.env.AESTHETICBOARD_QWEN_BASE_URL) qwenOptions.baseUrl = process.env.AESTHETICBOARD_QWEN_BASE_URL;
+  if (process.env.AESTHETICBOARD_QWEN_TIMEOUT_MS) qwenOptions.timeoutMs = Number(process.env.AESTHETICBOARD_QWEN_TIMEOUT_MS);
+  patch.providerOptions = { ...(patch.providerOptions || {}), 'qwen3.7-flash': qwenOptions };
+  return sanitizeProviderConfig(patch);
+}
+
 function readKeywordProviderConfig() {
   try {
     const filePath = keywordProviderConfigPath();
-    if (!fs.existsSync(filePath)) return defaultProviderConfig();
-    return sanitizeProviderConfig(readJsonFile(filePath) || {});
+    const base = fs.existsSync(filePath) ? readJsonFile(filePath) || {} : defaultProviderConfig();
+    return providerConfigWithEnvironment(base);
   } catch {
-    return defaultProviderConfig();
+    return providerConfigWithEnvironment(defaultProviderConfig());
   }
 }
 
@@ -121,6 +144,41 @@ function writeKeywordProviderConfig(config) {
   const sanitized = sanitizeProviderConfig({ ...config, updatedAtUtc: new Date().toISOString() });
   writeJsonFile(keywordProviderConfigPath(), sanitized);
   return sanitized;
+}
+
+function updateKeywordProviderConfig(request = {}) {
+  const current = readKeywordProviderConfig();
+  const provider = String(request.provider || request.activeProvider || current.activeProvider || 'local-mock');
+  const patch = {
+    ...current,
+    activeProvider: provider,
+    externalProviderEnabled: Boolean(request.externalProviderEnabled),
+    allowImageAccess: Boolean(request.allowImageAccess),
+    allowTextAccess: Boolean(request.allowTextAccess),
+    allowNetwork: Boolean(request.allowNetwork),
+    providerOptions: {
+      ...(current.providerOptions || {}),
+      ...(request.providerOptions && typeof request.providerOptions === 'object' ? request.providerOptions : {})
+    }
+  };
+  const saved = writeKeywordProviderConfig(patch);
+  return { ok: true, keywordProvider: keywordProviderState(saved), configPath: keywordProviderConfigPath() };
+}
+
+function keywordProviderDiagnostics() {
+  const config = readKeywordProviderConfig();
+  return { ok: true, diagnostics: providerDiagnosticsFromConfig(config), keywordProvider: keywordProviderState(config) };
+}
+
+async function testKeywordProvider(request = {}) {
+  const config = readKeywordProviderConfig();
+  const provider = String(request.provider || config.activeProvider || 'local-mock');
+  const diagnostics = providerDiagnosticsFromConfig(config);
+  const validation = validateKeywordProviderRequest({ provider, providerConfig: config });
+  if (!validation.ok) return { ok: false, error: validation.error, diagnostics, keywordProvider: keywordProviderState(config) };
+  if (provider === 'local-mock') return { ok: true, provider, diagnostics, keywordProvider: keywordProviderState(config), message: 'Local mock is available. No network request was made.' };
+  const result = await testProviderConnection(provider, { providerConfig: config, profileRoot: profileRoot() });
+  return { ...result, diagnostics: result?.diagnostics || diagnostics, keywordProvider: keywordProviderState(config) };
 }
 
 function dragHarnessLogPath() {
@@ -229,6 +287,14 @@ function visibleBounds(bounds) {
     x: primary.x + Math.round((primary.width - bounds.width) / 2),
     y: primary.y + Math.round((primary.height - bounds.height) / 2)
   };
+}
+
+function scheduleDerivativeBuild(assetId) {
+  if (!assetId) return;
+  setTimeout(() => {
+    try { generateAssetDerivatives(profileRoot(), assetId); }
+    catch (error) { console.warn('media derivative build failed', error?.message || error); }
+  }, 0);
 }
 
 function mediaRequestFromUrl(value) {
@@ -430,6 +496,7 @@ async function localizeRemoteImage(request) {
       height: request?.pixelHeight || 0,
       imageObject: request?.imageObject || {}
     });
+    scheduleDerivativeBuild(committed.assetId);
     return { ok: true, ...committed, persistence, captureJob: committed.captureJob, finalUrl: remote.finalUrl };
   } catch (error) {
     if (request?.captureId) updateCaptureJob(profileRoot(), request.captureId, { state: 'FAILED', dayCanvasId: request?.dayCanvasId || request?.boardDate || 'undated', sourceType: request?.sourceType || 'remote-url', candidateManifest: { sourceUrl: request?.url || '' }, imageObject: request?.imageObject || null, lastErrorCode: error?.message || 'REMOTE_LOCALIZE_FAILED' });
@@ -804,8 +871,11 @@ ipcMain.handle('export:capture-full-day-png', (_event, request) => captureFullDa
 ipcMain.handle('diagnostics:export-restore-fixture', (_event, request) => exportRestoreFixture(request));
 ipcMain.handle('backup:export-profile', (_event, request) => exportProfileBackup(request));
 ipcMain.handle('keyword:get-provider-state', () => keywordProviderState(readKeywordProviderConfig()));
+ipcMain.handle('keyword:get-provider-diagnostics', () => keywordProviderDiagnostics());
+ipcMain.handle('keyword:set-provider-config', (_event, request) => updateKeywordProviderConfig(request));
+ipcMain.handle('keyword:test-provider', (_event, request) => testKeywordProvider(request));
 ipcMain.handle('keyword:validate-provider', (_event, request) => validateKeywordProviderRequest({ ...(request || {}), providerConfig: readKeywordProviderConfig() }));
-ipcMain.handle('keyword:generate', (_event, request) => generateKeywordCandidates({ ...(request || {}), providerConfig: readKeywordProviderConfig() }));
+ipcMain.handle('keyword:generate', (_event, request) => generateKeywordCandidates({ ...(request || {}), providerConfig: readKeywordProviderConfig(), profileRoot: profileRoot() }));
 ipcMain.handle('media:relink-imported', (_event, request) => relinkImportedMedia(request));
 ipcMain.handle('media:preview-relink-batch', (_event, request) => previewMediaRelinkBatch(request));
 ipcMain.handle('media:apply-relink-batch', (_event, request) => applyMediaRelinkBatch(request));
@@ -838,6 +908,7 @@ ipcMain.handle('capture:commit-data-url', (_event, request) => {
       height: request?.pixelHeight || 0,
       imageObject: request?.imageObject || {}
     });
+    scheduleDerivativeBuild(committed.assetId);
     return { ok: true, ...committed, persistence, captureJob: committed.captureJob };
   } catch (error) {
     return { ok: false, error: error?.message || 'CAPTURE_COMMIT_FAILED' };

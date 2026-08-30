@@ -12,6 +12,8 @@ const DRAG_HARNESS_LIMIT = 30;
 const TEXT_PREVIEW_LIMIT = 140;
 const AI_KEYWORD_MAX = 8;
 const AI_KEYWORD_HISTORY_MAX = 32;
+const AI_JOB_HISTORY_MAX = 160;
+const AI_JOB_TERMINAL_STATES = new Set(["succeeded", "failed", "canceled"]);
 const copyIcon = "refer/icon/copy (1).svg";
 
 const surfaces = {
@@ -62,6 +64,13 @@ let durableSearchRequest = 0;
 let retrySequence = Number(state.retrySequence || 0);
 let conflictState = { active: false, message: "" };
 let mediaRelinkBatchState = null;
+let aiAutoKeywordEnabled = false;
+let aiAutoKeywordRunning = false;
+let aiBatchKeywordRunning = false;
+let aiBatchStopRequested = false;
+let aiBatchKeywordStats = { total: 0, completed: 0, failed: 0, skipped: 0, currentId: "", startedAtUtc: "", stopped: false };
+const AI_AUTO_KEYWORD_BATCH_LIMIT = 6;
+const AI_BATCH_KEYWORD_DELAY_MS = 850;
 
 function startOfDay(date) { return new Date(date.getFullYear(), date.getMonth(), date.getDate()); }
 function padDatePart(value) { return String(value).padStart(2, "0"); }
@@ -79,11 +88,13 @@ function cloneKeywordCandidates(candidates) {
     const createdAtUtc = String(candidate.createdAtUtc || candidate.generatedAtUtc || new Date().toISOString());
     return {
       id: String(candidate.id || "candidate-" + index),
-      text: String(candidate.text || "").trim(),
+      text: String(candidate.text || candidate.en || "").trim(),
+      zh: String(candidate.zh || candidate.translationZh || "").trim(),
       confidence: Number(candidate.confidence || 0),
       source: String(candidate.source || candidate.provider || "local-mock"),
       provider: String(candidate.provider || candidate.source || "local-mock"),
       state,
+      promptVersion: String(candidate.promptVersion || "keyword-prompt-v1"),
       createdAtUtc,
       reviewedAtUtc: String(candidate.reviewedAtUtc || ""),
       acceptedAtUtc: String(candidate.acceptedAtUtc || ""),
@@ -93,6 +104,51 @@ function cloneKeywordCandidates(candidates) {
   }).filter((candidate) => candidate.text).slice(0, AI_KEYWORD_HISTORY_MAX);
 }
 function cloneItems(items) { return items.map((item) => ({ ...item, keywords: [...(item.keywords || [])], keywordCandidates: cloneKeywordCandidates(item.keywordCandidates) })); }
+function cleanAiJobKeyPart(value) { return String(value || "").trim().toLowerCase().replace(/[^a-z0-9_.:-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 96); }
+function aiJobKeyFor(input = {}) {
+  return [input.objectId || input.assetId || "object", input.assetId || "no-asset", input.provider || "local-mock", input.model || "default", input.promptVersion || "keyword-prompt-v1", input.locale || "en"].map(cleanAiJobKeyPart).join("|");
+}
+function cloneAiJobs(jobs) {
+  const values = Array.isArray(jobs) ? jobs : Object.values(jobs || {});
+  return values.map((job, index) => ({
+    id: String(job.id || job.jobId || "ai-job-" + index),
+    key: String(job.key || aiJobKeyFor(job)),
+    objectId: String(job.objectId || ""),
+    dayCanvasId: String(job.dayCanvasId || ""),
+    assetId: String(job.assetId || ""),
+    provider: String(job.provider || job.providerId || "local-mock"),
+    model: String(job.model || ""),
+    promptVersion: String(job.promptVersion || "keyword-prompt-v1"),
+    locale: String(job.locale || "en"),
+    state: ["queued", "sending", "waiting", "succeeded", "failed", "canceled"].includes(String(job.state)) ? String(job.state) : "queued",
+    retryCount: Number(job.retryCount || 0),
+    error: String(job.error || ""),
+    recoverable: Boolean(job.recoverable),
+    requestId: String(job.requestId || job.id || ""),
+    startedAtUtc: String(job.startedAtUtc || ""),
+    completedAtUtc: String(job.completedAtUtc || ""),
+    updatedAtUtc: String(job.updatedAtUtc || job.createdAtUtc || new Date().toISOString()),
+    createdAtUtc: String(job.createdAtUtc || job.updatedAtUtc || new Date().toISOString())
+  })).filter((job) => job.objectId || job.assetId || job.id).slice(-AI_JOB_HISTORY_MAX);
+}
+function recoverAiJobsForLaunch(jobs) {
+  const now = new Date().toISOString();
+  const recoveredByKey = new Map();
+  cloneAiJobs(jobs).forEach((job) => {
+    const key = String(job.key || aiJobKeyFor(job));
+    const next = { ...job, key };
+    if (["queued", "sending", "waiting"].includes(next.state)) {
+      next.state = "failed";
+      next.error = "AI_JOB_INTERRUPTED";
+      next.recoverable = true;
+      next.completedAtUtc ||= now;
+      next.updatedAtUtc = now;
+    }
+    const previous = recoveredByKey.get(key);
+    if (!previous || String(previous.updatedAtUtc).localeCompare(String(next.updatedAtUtc)) < 0) recoveredByKey.set(key, next);
+  });
+  return [...recoveredByKey.values()].slice(-AI_JOB_HISTORY_MAX);
+}
 
 function createDay(seedItems = []) {
   return { title: "", camera: { ...DEFAULT_CAMERA }, pasteSequence: 0, items: cloneItems(seedItems), trash: [] };
@@ -100,7 +156,7 @@ function createDay(seedItems = []) {
 
 function loadState() {
   const todayId = dateKeyFromDate(new Date());
-  const fallback = { activeDayId: todayId, viewMode: "day", surface: "quiet", days: { [todayId]: createDay(initialItems) }, selectedId: "img-01", activeKeywordId: null, expandedNoteId: null, dragHarness: [] };
+  const fallback = { activeDayId: todayId, viewMode: "day", surface: "quiet", days: { [todayId]: createDay(initialItems) }, selectedId: "img-01", activeKeywordId: null, expandedNoteId: null, dragHarness: [], aiJobs: [] };
   try {
     const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
     if (saved.days) return normalizeState({ ...fallback, ...saved });
@@ -151,6 +207,17 @@ function normalizeState(value) {
   value.expandedNoteId ??= null;
   value.retryQueue = Array.isArray(value.retryQueue) ? value.retryQueue : [];
   value.retrySequence = Number(value.retrySequence || 0);
+  value.aiJobs = recoverAiJobsForLaunch(value.aiJobs);
+  const jobsByObject = new Map(value.aiJobs.map((job) => [job.objectId, job]));
+  Object.values(value.days).forEach((board) => (board.items || []).forEach((item) => {
+    const job = jobsByObject.get(item.id);
+    if (!job) return;
+    item.aiKeywordJobId = job.id;
+    item.aiKeywordProvider = job.provider || item.aiKeywordProvider || "local-mock";
+    item.aiKeywordPromptVersion = job.promptVersion || item.aiKeywordPromptVersion || "keyword-prompt-v1";
+    if (job.state === "sending" || job.state === "waiting" || job.state === "queued") item.aiKeywordState = "pending";
+    if (job.state === "failed") { item.aiKeywordState = "failed"; item.aiKeywordError = job.error || item.aiKeywordError || "AI job failed"; }
+  }));
   value.dragHarness = Array.isArray(value.dragHarness) ? value.dragHarness.slice(0, DRAG_HARNESS_LIMIT) : [];
   return value;
 }
@@ -176,6 +243,11 @@ function objectMutationPayload(item) {
     keywordCandidates: cloneKeywordCandidates(item.keywordCandidates),
     aiKeywordState: item.aiKeywordState || "idle",
     aiKeywordProvider: item.aiKeywordProvider || "local-mock",
+    aiKeywordJobId: item.aiKeywordJobId || "",
+    aiKeywordLastRunAtUtc: item.aiKeywordLastRunAtUtc || "",
+    aiKeywordError: item.aiKeywordError || "",
+    aiKeywordRetryWhenDurable: Boolean(item.aiKeywordRetryWhenDurable),
+    aiKeywordPromptVersion: item.aiKeywordPromptVersion || "keyword-prompt-v1",
     lifecycleState: item.lifecycleState || "READY",
     assetId: item.assetId || "",
     sourceUrl: item.sourceUrl || "",
@@ -231,7 +303,7 @@ function applyCaptureRecovery(recovery) {
 
 function snapshotForPersistence() {
   return JSON.parse(JSON.stringify({ ...state, persistenceRevision: lastAckRevision }, (key, value) => {
-    if (["pendingMutationIds", "mutationError", "pendingDataUrl"].includes(key)) return undefined;
+    if (["pendingMutationIds", "mutationError", "pendingDataUrl", "aiKeywordInFlight"].includes(key)) return undefined;
     return value;
   }));
 }
@@ -935,7 +1007,7 @@ async function repairMediaIndexFromMenu(popover = null) {
     if (!result?.ok) throw new Error(result?.error || "Repair failed");
     profileState.mediaRepair = result;
     saveState.textContent = `Media repaired: ${result.originals} originals`;
-    if (popover) openDataPrivacyPopover(popover);
+    if (popover) refreshAiPopover(popover);
     else openActionPopover(document.querySelector('[data-popover="more"]'));
   } catch (error) {
     saveState.textContent = "Repair failed";
@@ -952,7 +1024,7 @@ async function exportRestoreFixtureFromMenu(popover) {
     if (!result?.ok) throw new Error(result?.error || "Fixture export failed");
     saveState.textContent = "Fixture exported";
     saveState.title = result.filePath || result.fileName || "";
-    openDataPrivacyPopover(popover);
+    refreshAiPopover(popover);
   } catch (error) { saveState.textContent = "Fixture failed"; saveState.title = error?.message || "Fixture export failed"; }
 }
 async function exportProfileBackupFromMenu(popover) {
@@ -964,7 +1036,7 @@ async function exportProfileBackupFromMenu(popover) {
     if (!result?.ok) throw new Error(result?.error || "Backup export failed");
     saveState.textContent = "Backup exported";
     saveState.title = result.filePath || result.fileName || "";
-    openDataPrivacyPopover(popover);
+    refreshAiPopover(popover);
   } catch (error) { saveState.textContent = "Backup failed"; saveState.title = error?.message || "Backup export failed"; }
 }
 async function verifyRestoreProfileFromMenu(popover) {
@@ -976,7 +1048,7 @@ async function verifyRestoreProfileFromMenu(popover) {
     profileState.restoreVerification = result;
     saveState.textContent = `Verified ${result.days} days / ${result.objects} objects`;
     saveState.title = `trash ${result.trash}, media ${result.mediaAssets}, capture jobs ${result.captureJobs}, failed ${result.failedCaptureJobs}, retry ${result.retryQueue || 0}`;
-    openDataPrivacyPopover(popover);
+    refreshAiPopover(popover);
   } catch (error) { saveState.textContent = "Verify failed"; saveState.title = error?.message || "Verify failed"; }
 }
 function missingMediaRefsForCurrentDay() {
@@ -1016,7 +1088,7 @@ function createMediaRelinkBatchSummary() {
 async function previewMediaRelinkBatchFromMenu(popover) {
   if (!shellBridge?.previewMediaRelinkBatch) return;
   const refs = missingMediaRefsForCurrentDay();
-  if (!refs.length) { saveState.textContent = "No missing media"; openDataPrivacyPopover(popover); return; }
+  if (!refs.length) { saveState.textContent = "No missing media"; refreshAiPopover(popover); return; }
   saveState.textContent = "Choose media folder";
   try {
     const result = await shellBridge.previewMediaRelinkBatch({ refs });
@@ -1024,7 +1096,7 @@ async function previewMediaRelinkBatchFromMenu(popover) {
     if (!result?.ok) throw new Error(result?.error || "Media scan failed");
     mediaRelinkBatchState = result;
     saveState.textContent = "Matched " + result.matched + " / " + result.needed;
-    openDataPrivacyPopover(popover);
+    refreshAiPopover(popover);
   } catch (error) {
     saveState.textContent = "Media scan failed";
     saveState.title = error?.message || "Media scan failed";
@@ -1059,7 +1131,7 @@ async function applyMediaRelinkBatchFromMenu(popover) {
     renderCanvas();
     if (mutations.length) persist({ immediate: true, mutations });
     saveState.textContent = "Repaired " + result.repaired + " media";
-    openDataPrivacyPopover(popover);
+    refreshAiPopover(popover);
   } catch (error) {
     saveState.textContent = "Batch repair failed";
     saveState.title = error?.message || "Batch repair failed";
@@ -1069,9 +1141,447 @@ async function applyMediaRelinkBatchFromMenu(popover) {
 function createPrivacyCopy() {
   const copy = document.createElement("p");
   copy.className = "privacy-copy";
-  copy.textContent = "Backup includes days, board objects, trash, media references, capture jobs, retry metadata, and rebuildable search metadata. Restore preview is read-only; import-as-new-day adds a separate day and never overwrites your current boards. AI keywords currently use local mock only; external providers require explicit opt-in later.";
+  copy.textContent = "Backup includes days, board objects, trash, media references, capture jobs, retry metadata, and rebuildable search metadata. Restore preview is read-only; import-as-new-day adds a separate day and never overwrites your current boards. AI keyword providers stay off-network unless you explicitly enable an external provider.";
   return copy;
 }
+function activeProviderRecord() {
+  const activeId = profileState.keywordProvider?.activeProvider || "local-mock";
+  return (profileState.keywordProvider?.providers || []).find((provider) => provider.id === activeId) || null;
+}
+
+function providerEnabledSummary(provider) {
+  if (!provider) return "Local mock";
+  if (!provider.external) return "Local mock";
+  if (!provider.enabled) return "Not available";
+  return profileState.keywordProvider?.externalProviderEnabled ? (aiAutoKeywordEnabled ? "Auto on" : "Manual on") : "Off";
+}
+
+function refreshAiPopover(popover) {
+  if (!popover) return;
+  if (popover.dataset?.surface === "more") openMorePopover(popover);
+  else openDataPrivacyPopover(popover);
+}
+
+
+function externalAiReady() {
+  const provider = activeProviderRecord();
+  return Boolean(provider?.external && provider.enabled && profileState.keywordProvider?.externalProviderEnabled && profileState.keywordProvider?.permissions?.imageAccess && profileState.keywordProvider?.permissions?.network);
+}
+
+function isAiKeywordImageReady(item) {
+  if (!item || item.kind === "link") return true;
+  return Boolean(item.assetId && String(item.lifecycleState || "").toUpperCase() === "DURABLE");
+}
+
+function markAiKeywordWaitingForDurable(item, retryWhenDurable = false) {
+  item.aiKeywordState = retryWhenDurable ? "pending" : "failed";
+  item.aiKeywordError = "AI_IMAGE_NOT_DURABLE";
+  item.aiKeywordRetryWhenDurable = Boolean(retryWhenDurable);
+  item.aiKeywordInFlight = false;
+  saveState.textContent = retryWhenDurable ? "Waiting for image save" : "Image not saved yet";
+  renderCanvas();
+}
+
+function clearAiDurableWait(item) {
+  if (item.aiKeywordError !== "AI_IMAGE_NOT_DURABLE" && !item.aiKeywordRetryWhenDurable) return;
+  const shouldRetry = Boolean(item.aiKeywordRetryWhenDurable);
+  item.aiKeywordRetryWhenDurable = false;
+  item.aiKeywordError = "";
+  item.aiKeywordState = shouldRetry ? "pending" : "idle";
+  if (shouldRetry) window.setTimeout(() => { if (isAiKeywordImageReady(item)) generateKeywordCandidatesForItem(item, false); }, 80);
+}
+
+function aiJobs() { state.aiJobs = cloneAiJobs(state.aiJobs); return state.aiJobs; }
+function latestAiJobForItem(item) {
+  const id = String(item?.id || "");
+  return aiJobs().filter((job) => job.objectId === id).sort((a, b) => String(b.updatedAtUtc).localeCompare(String(a.updatedAtUtc)))[0] || null;
+}
+function activeAiJobForItem(item) {
+  const latest = latestAiJobForItem(item);
+  return latest && !AI_JOB_TERMINAL_STATES.has(latest.state) ? latest : null;
+}
+function aiJobLabel(job) {
+  if (!job) return "";
+  const labels = { queued: "Queued", sending: "Sending", waiting: "Waiting", succeeded: "Ready", failed: job.error === "AI_JOB_INTERRUPTED" ? "Interrupted" : "Failed", canceled: "Canceled" };
+  return labels[job.state] || "AI job";
+}
+function resetAiBatchStats(total = 0) {
+  aiBatchKeywordStats = { total: Number(total || 0), completed: 0, failed: 0, skipped: 0, currentId: "", startedAtUtc: new Date().toISOString(), stopped: false };
+}
+function aiBatchStatusText() {
+  if (!aiBatchKeywordRunning && !aiBatchKeywordStats.total) return String(aiBatchEligibleItems().length) + " ready";
+  const stats = aiBatchKeywordStats;
+  if (!stats.total) return aiBatchKeywordRunning ? "Starting" : String(aiBatchEligibleItems().length) + " ready";
+  const done = Number(stats.completed || 0) + Number(stats.failed || 0) + Number(stats.skipped || 0);
+  const suffix = stats.failed ? " · " + stats.failed + " failed" : stats.skipped ? " · " + stats.skipped + " skipped" : "";
+  if (aiBatchKeywordRunning) return done + " / " + stats.total + " done" + suffix;
+  return (stats.stopped ? "Stopped " : "Done ") + done + " / " + stats.total + suffix;
+}
+function candidateDetailTitle(candidate) {
+  const parts = [String(candidate.text || "")];
+  if (candidate.zh) parts.push(String(candidate.zh));
+  const meta = [candidate.provider || candidate.source || "", candidate.promptVersion || "", typeof candidate.confidence === "number" ? Math.round(candidate.confidence * 100) + "% confidence" : ""].filter(Boolean).join(" / " );
+  if (meta) parts.push(meta);
+  return parts.filter(Boolean).join("\n");
+}
+function upsertAiJob(jobPatch = {}) {
+  const now = new Date().toISOString();
+  const jobs = aiJobs();
+  const key = String(jobPatch.key || aiJobKeyFor(jobPatch));
+  const existing = jobs.find((job) => job.id === jobPatch.id || job.key === key && !AI_JOB_TERMINAL_STATES.has(job.state));
+  const next = {
+    ...(existing || {}),
+    ...jobPatch,
+    id: String(jobPatch.id || existing?.id || "ai-job-" + Date.now() + "-" + Math.random().toString(16).slice(2, 7)),
+    key,
+    state: String(jobPatch.state || existing?.state || "queued"),
+    createdAtUtc: String(existing?.createdAtUtc || jobPatch.createdAtUtc || now),
+    updatedAtUtc: now
+  };
+  if (existing) Object.assign(existing, next);
+  else jobs.push(next);
+  state.aiJobs = cloneAiJobs(jobs).slice(-AI_JOB_HISTORY_MAX);
+  return state.aiJobs.find((job) => job.id === next.id) || next;
+}
+function persistAiJob(job, immediate = false) {
+  persist({ type: "ai.job", targetId: job.objectId || null, immediate, payload: { job: { ...job } } });
+}
+function cancelAiJobForItem(item) {
+  const job = activeAiJobForItem(item) || latestAiJobForItem(item);
+  let canceled = null;
+  if (job) canceled = upsertAiJob({ ...job, state: "canceled", completedAtUtc: new Date().toISOString(), error: "Canceled by user" });
+  item.aiKeywordState = visibleKeywordCandidates(item).length ? "suggested" : "idle";
+  item.aiKeywordError = "";
+  item.aiKeywordRetryWhenDurable = false;
+  item.aiKeywordInFlight = false;
+  saveState.textContent = "AI canceled";
+  renderCanvas();
+  if (canceled) persistAiJob(canceled, true);
+  else persist({ type: "keyword.candidates", targetId: item.id, immediate: true, payload: { provider: item.aiKeywordProvider || "local-mock", promptVersion: item.aiKeywordPromptVersion || "keyword-prompt-v1", state: item.aiKeywordState, error: "", candidates: cloneKeywordCandidates(item.keywordCandidates) } });
+}
+async function retryAiJobForItem(item) {
+  await refreshKeywordProviderState();
+  const providerId = profileState.keywordProvider?.activeProvider || "local-mock";
+  const job = latestAiJobForItem(item);
+  if (providerId !== "local-mock" && !isAiKeywordImageReady(item)) {
+    const options = qwenProviderOptions();
+    const request = keywordGatewayRequest(item, providerId);
+    const requestPromptVersion = request.promptVersion || "keyword-prompt-v1";
+    const queued = upsertAiJob({ ...(job || {}), objectId: item.id, dayCanvasId: state.activeDayId, assetId: item.assetId || "", provider: providerId, model: options.model, promptVersion: requestPromptVersion, locale: request.locale || "en", state: "queued", retryCount: Number(job?.retryCount || 0) + 1, error: "", requestId: request.requestId });
+    item.aiKeywordProvider = providerId;
+    item.aiKeywordJobId = queued.id;
+    persistAiJob(queued, true);
+    markAiKeywordWaitingForDurable(item, true);
+    return;
+  }
+  if (job) upsertAiJob({ ...job, state: "queued", retryCount: Number(job.retryCount || 0) + 1, error: "" });
+  generateKeywordCandidatesForItem(item, false);
+}
+function aiJobCounts() {
+  return aiJobs().reduce((counts, job) => {
+    counts[job.state] = (counts[job.state] || 0) + 1;
+    return counts;
+  }, {});
+}
+function hasAcceptedOrPinnedKeywords(item) {
+  return Boolean((item.keywords || []).length || cloneKeywordCandidates(item.keywordCandidates).some((candidate) => candidate.state === "accepted"));
+}
+function canGenerateKeywordsInBatch(item) {
+  if (!externalAiReady()) return false;
+  if (!item || item.kind === "link" || item.aiKeywordState === "pending" || activeAiJobForItem(item)) return false;
+  if (!isAiKeywordImageReady(item)) return false;
+  return !hasAcceptedOrPinnedKeywords(item);
+}
+function canAutoGenerateKeywords(item) {
+  if (!aiAutoKeywordEnabled) return false;
+  if (item?.aiKeywordState === "failed") return false;
+  return canGenerateKeywordsInBatch(item);
+}
+function aiBatchEligibleItems() {
+  return items().filter(canGenerateKeywordsInBatch);
+}
+function sleep(ms) { return new Promise((resolve) => window.setTimeout(resolve, ms)); }
+
+function disableAiAutoKeywords(reason = "window-left") {
+  if (!aiAutoKeywordEnabled) return;
+  aiAutoKeywordEnabled = false;
+  saveState.textContent = reason === "mock" ? "AI auto off" : "AI auto paused";
+}
+
+function maybeAutoGenerateKeywords(item) {
+  if (!canAutoGenerateKeywords(item)) return;
+  window.setTimeout(() => {
+    if (canAutoGenerateKeywords(item)) generateKeywordCandidatesForItem(item, false);
+  }, 120);
+}
+
+async function runAutoKeywordsForCurrentDay() {
+  if (aiAutoKeywordRunning || !aiAutoKeywordEnabled) return;
+  aiAutoKeywordRunning = true;
+  try {
+    const candidates = items().filter(canAutoGenerateKeywords).slice(0, AI_AUTO_KEYWORD_BATCH_LIMIT);
+    for (const item of candidates) {
+      if (!aiAutoKeywordEnabled) break;
+      await generateKeywordCandidatesForItem(item, false);
+    }
+  } finally {
+    aiAutoKeywordRunning = false;
+  }
+}
+async function runBatchKeywordsForCurrentDay(popover = null) {
+  await refreshKeywordProviderState();
+  if (!externalAiReady() || aiBatchKeywordRunning) {
+    saveState.textContent = externalAiReady() ? "AI batch running" : "Enable Qwen first";
+    if (popover) refreshAiPopover(popover);
+    return;
+  }
+  const queue = aiBatchEligibleItems();
+  if (!queue.length) {
+    saveState.textContent = "No images need AI";
+    resetAiBatchStats(0);
+    if (popover) refreshAiPopover(popover);
+    return;
+  }
+  aiBatchKeywordRunning = true;
+  aiBatchStopRequested = false;
+  resetAiBatchStats(queue.length);
+  saveState.textContent = "AI batch 0 / " + queue.length;
+  if (popover) refreshAiPopover(popover);
+  try {
+    for (let index = 0; index < queue.length; index += 1) {
+      if (aiBatchStopRequested) break;
+      const item = queue[index];
+      if (!canGenerateKeywordsInBatch(item)) { aiBatchKeywordStats.skipped += 1; continue; }
+      aiBatchKeywordStats.currentId = item.id;
+      state.selectedId = item.id;
+      state.activeKeywordId = item.id;
+      saveState.textContent = "AI batch " + (index + 1) + " / " + queue.length;
+      if (popover) refreshAiPopover(popover);
+      renderCanvas();
+      await generateKeywordCandidatesForItem(item, false);
+      if (item.aiKeywordState === "failed") aiBatchKeywordStats.failed += 1;
+      else aiBatchKeywordStats.completed += 1;
+      aiBatchKeywordStats.currentId = "";
+      if (popover) refreshAiPopover(popover);
+      if (!aiBatchStopRequested) await sleep(AI_BATCH_KEYWORD_DELAY_MS);
+    }
+  } finally {
+    aiBatchKeywordStats.currentId = "";
+    aiBatchKeywordStats.stopped = Boolean(aiBatchStopRequested);
+    aiBatchKeywordRunning = false;
+    saveState.textContent = aiBatchKeywordStats.stopped ? "AI batch stopped" : "AI batch complete";
+    aiBatchStopRequested = false;
+    if (popover) refreshAiPopover(popover);
+    renderCanvas();
+  }
+}
+function stopBatchKeywords(popover = null) {
+  aiBatchStopRequested = true;
+  saveState.textContent = "Stopping AI batch";
+  if (popover) refreshAiPopover(popover);
+}
+
+async function toggleAiAutoKeywords(popover) {
+  if (aiAutoKeywordEnabled) {
+    disableAiAutoKeywords("manual");
+    refreshAiPopover(popover);
+    return;
+  }
+  await refreshKeywordProviderState();
+  if (!externalAiReady()) {
+    saveState.textContent = "Enable Qwen first";
+    refreshAiPopover(popover);
+    return;
+  }
+  aiAutoKeywordEnabled = true;
+  saveState.textContent = "AI auto on";
+  refreshAiPopover(popover);
+  runAutoKeywordsForCurrentDay();
+}
+
+function qwenProviderOptions() {
+  const options = profileState.keywordProvider?.config?.providerOptions?.["qwen3.7-flash"] || {};
+  const diagnostics = profileState.keywordProvider?.diagnostics?.qwen || {};
+  return {
+    model: diagnostics.model || options.model || "qwen3.7-flash",
+    baseUrl: diagnostics.baseUrl || options.baseUrl || "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    timeoutMs: Number(diagnostics.timeoutMs || options.timeoutMs || 60000),
+    apiKeyAvailable: Boolean(diagnostics.apiKeyAvailable),
+    apiKeySource: diagnostics.apiKeySource || "not set",
+    modelSource: diagnostics.modelSource || (options.model ? "profile config" : "default"),
+    baseUrlSource: diagnostics.baseUrlSource || (options.baseUrl ? "profile config" : "default"),
+    timeoutSource: diagnostics.timeoutSource || (options.timeoutMs ? "profile config" : "default"),
+    promptVersion: diagnostics.promptVersion || "keyword-prompt-v1",
+    promptVersionSource: diagnostics.promptVersionSource || "fallback"
+  };
+}
+
+function providerDiagnosticsRows(options) {
+  return createDetailRows([
+    ["Effective model", options.model],
+    ["Model source", options.modelSource],
+    ["Prompt version", options.promptVersion],
+    ["Prompt source", options.promptVersionSource],
+    ["Qwen key", options.apiKeyAvailable ? "Available" : "Not set"],
+    ["Key source", options.apiKeySource],
+    ["Endpoint", options.baseUrl.replace(/^https?:\/\//, "")],
+    ["Timeout", String(options.timeoutMs) + " ms"]
+  ]);
+}
+function providerStatusRows(options) {
+  const permissions = profileState.keywordProvider?.permissions || {};
+  const counts = aiJobCounts();
+  return createDetailRows([
+    ["AI mode", profileState.keywordProvider?.externalProviderEnabled ? "Qwen enabled" : "Local mock / off"],
+    ["Provider", profileState.keywordProvider?.activeProvider || "local-mock"],
+    ["Model", options.model],
+    ["Prompt", options.promptVersion],
+    ["Image sent", permissions.imageAccess ? "Working copy only" : "No"],
+    ["Text sent", permissions.textAccess ? "Keywords only" : "No"],
+    ["Network", permissions.network ? "Allowed" : "Off"],
+    ["Auto keywords", aiAutoKeywordEnabled ? "On for this window" : "Off"],
+    ["Session rule", "Turns off when window leaves"],
+    ["AI jobs", String(counts.queued || 0) + " queued / " + String(counts.sending || 0) + " sending / " + String(counts.failed || 0) + " failed"],
+    ["Batch", aiBatchStatusText()]
+  ]);
+}
+
+
+function aiProviderSetupHint() {
+  const options = qwenProviderOptions();
+  if (!profileState.keywordProvider?.externalProviderEnabled) return "AI is off. Enable Qwen from More when you want external suggestions.";
+  if (!options.apiKeyAvailable) return "Qwen is enabled, but the desktop main process cannot see an API key. Start Electron from a PowerShell session with AESTHETICBOARD_QWEN_API_KEY or DASHSCOPE_API_KEY.";
+  if (!profileState.keywordProvider?.permissions?.network) return "Qwen is enabled but network access is off. Turn Qwen off/on from More to restore the consented network setting.";
+  return "Qwen is enabled. If keywords fail, check the image-local message first; model-name failures point to AESTHETICBOARD_QWEN_MODEL.";
+}
+
+function createAiProviderSetupHint() {
+  const hint = document.createElement("p");
+  hint.className = "settings-section-copy ai-troubleshooting";
+  hint.textContent = aiProviderSetupHint();
+  return hint;
+}
+
+function createMoreAiControls(popover) {
+  const provider = activeProviderRecord();
+  const options = qwenProviderOptions();
+  const counts = aiJobCounts();
+  const qwenEnabled = profileState.keywordProvider?.activeProvider === "qwen3.7-flash" && profileState.keywordProvider?.externalProviderEnabled;
+  const panel = document.createElement("div");
+  panel.className = "ai-provider-settings ai-more-controls" + (qwenEnabled ? " qwen-enabled" : "");
+  const head = document.createElement("div");
+  head.className = "ai-provider-head";
+  const title = document.createElement("strong");
+  title.textContent = "AI Keywords";
+  const stateLabel = document.createElement("span");
+  stateLabel.textContent = providerEnabledSummary(provider);
+  head.append(title, stateLabel);
+
+  const rows = createDetailRows([
+    ["Provider", profileState.keywordProvider?.activeProvider === "qwen3.7-flash" && profileState.keywordProvider?.externalProviderEnabled ? "Qwen" : "Off / local"],
+    ["Model", options.model],
+    ["Key", options.apiKeyAvailable ? "Available" : "Not set"],
+    ["Auto", aiAutoKeywordEnabled ? "On this window" : "Off"],
+    ["Queue", aiBatchStatusText()],
+    ["Failed", String(counts.failed || 0)]
+  ]);
+
+  const actions = document.createElement("div");
+  actions.className = "ai-provider-actions";
+  const enableQwen = document.createElement("button");
+  enableQwen.type = "button";
+  enableQwen.textContent = qwenEnabled ? "Turn AI off" : "Enable Qwen";
+  enableQwen.title = qwenEnabled ? "Stop new external AI jobs and keep approved keywords" : "Turn on Qwen for new keyword suggestions";
+  enableQwen.disabled = !shellBridge?.setKeywordProviderConfig;
+  enableQwen.addEventListener("click", () => setAiProviderFromMenu(popover, qwenEnabled ? "local-mock" : "qwen3.7-flash"));
+  const test = document.createElement("button");
+  test.type = "button";
+  test.textContent = "Test connection";
+  test.disabled = !shellBridge?.testKeywordProvider || !profileState.keywordProvider?.externalProviderEnabled || profileState.keywordProvider?.activeProvider === "local-mock";
+  test.addEventListener("click", () => testAiProviderFromMenu(popover));
+  const auto = document.createElement("button");
+  auto.type = "button";
+  auto.textContent = aiAutoKeywordEnabled ? "Auto off" : "Auto keywords";
+  auto.disabled = !externalAiReady();
+  auto.addEventListener("click", () => toggleAiAutoKeywords(popover));
+  const batch = document.createElement("button");
+  batch.type = "button";
+  batch.textContent = aiBatchKeywordRunning ? "Stop day AI" : "Generate day";
+  batch.title = aiBatchKeywordRunning ? "Stop unfinished current-day AI suggestions" : "Generate candidate keywords for eligible Durable images on this day";
+  batch.disabled = !externalAiReady() || (!aiBatchKeywordRunning && !aiBatchEligibleItems().length);
+  batch.addEventListener("click", () => aiBatchKeywordRunning ? stopBatchKeywords(popover) : runBatchKeywordsForCurrentDay(popover));
+  actions.append(enableQwen, test, auto, batch);
+
+  const hint = document.createElement("p");
+  hint.className = "ai-provider-hint";
+  hint.textContent = profileState.keywordProvider?.externalProviderEnabled ? "Qwen can use working image copies for new suggestions. Details live in Data & Privacy." : "AI is off by default. Enable Qwen only when you want external suggestions.";
+  panel.append(head, rows, actions, hint);
+  return panel;
+}
+
+
+async function refreshKeywordProviderState() {
+  if (!shellBridge?.getKeywordProviderState) return;
+  try {
+    profileState.keywordProvider = await shellBridge.getKeywordProviderState();
+    if (shellBridge?.getKeywordProviderDiagnostics) {
+      const diagnostics = await shellBridge.getKeywordProviderDiagnostics();
+      if (diagnostics?.diagnostics) profileState.keywordProvider.diagnostics = diagnostics.diagnostics;
+    }
+  }
+  catch {}
+}
+
+async function setAiProviderFromMenu(popover, providerId) {
+  if (!shellBridge?.setKeywordProviderConfig) return;
+  saveState.textContent = providerId === "local-mock" ? "AI mock selected" : "Enabling Qwen";
+  const qwenOptions = qwenProviderOptions();
+  const request = providerId === "local-mock" ? {
+    provider: "local-mock",
+    externalProviderEnabled: false,
+    allowImageAccess: false,
+    allowTextAccess: true,
+    allowNetwork: false,
+    providerOptions: { "qwen3.7-flash": qwenOptions }
+  } : {
+    provider: "qwen3.7-flash",
+    externalProviderEnabled: true,
+    allowImageAccess: true,
+    allowTextAccess: true,
+    allowNetwork: true,
+    providerOptions: { "qwen3.7-flash": qwenOptions }
+  };
+  try {
+    const result = await shellBridge.setKeywordProviderConfig(request);
+    if (!result?.ok) throw new Error(result?.error || "Provider update failed");
+    profileState.keywordProvider = result.keywordProvider || profileState.keywordProvider;
+    if (providerId === "local-mock") disableAiAutoKeywords("mock");
+    saveState.textContent = providerId === "local-mock" ? "Local mock ready" : "Qwen enabled";
+    refreshAiPopover(popover);
+  } catch (error) {
+    saveState.textContent = "Provider update failed";
+    saveState.title = error?.message || "Provider update failed";
+  }
+}
+
+async function testAiProviderFromMenu(popover) {
+  if (!shellBridge?.testKeywordProvider) return;
+  saveState.textContent = "Testing provider";
+  try {
+    const result = await shellBridge.testKeywordProvider({ provider: profileState.keywordProvider?.activeProvider || "local-mock" });
+    if (result?.keywordProvider) profileState.keywordProvider = result.keywordProvider;
+    if (!result?.ok) throw new Error(result?.error || "Provider test failed");
+    saveState.textContent = "Provider connected";
+    const qwen = result.diagnostics?.qwen || profileState.keywordProvider?.diagnostics?.qwen || {};
+    saveState.title = (result.provider || profileState.keywordProvider?.activeProvider || "Provider") + (qwen.model ? " / " + qwen.model : "");
+  } catch (error) {
+    const code = error?.message || "Provider test failed";
+    saveState.textContent = readableAiKeywordError(code);
+    saveState.title = [aiKeywordErrorDetail(code), code ? "Error code: " + code : ""].filter(Boolean).join("\n");
+  }
+  refreshAiPopover(popover);
+}
+
 function createProviderCapabilityList() {
   const providers = profileState.keywordProvider?.providers || [];
   const list = document.createElement("div");
@@ -1083,8 +1593,9 @@ function createProviderCapabilityList() {
     name.textContent = provider.label || provider.id;
     const detail = document.createElement("span");
     const facts = [provider.external ? "external" : "local", provider.canReadImage ? "reads image" : "no image access", provider.canReadText ? "reads text" : "no text access", provider.requiresNetwork ? "network" : "offline"];
-    detail.textContent = facts.join(" / ") + (provider.enabled ? "" : " / disabled");
-    row.title = provider.description || "";
+    const status = provider.enabled ? (provider.external ? "available after opt-in" : "available") : (provider.id === "gpt-5.7-luna" ? "future only / not connected yet" : "disabled");
+    detail.textContent = [...facts, status].join(" / ");
+    row.title = provider.consentCopy || provider.description || "";
     row.append(name, detail);
     list.appendChild(row);
   });
@@ -1092,6 +1603,7 @@ function createProviderCapabilityList() {
 }
 
 function openDataPrivacyPopover(popover) {
+  popover.dataset.surface = "privacy";
   popover.className = "popover profile-popover privacy-popover";
   popover.innerHTML = "";
   const title = document.createElement("h2");
@@ -1116,17 +1628,19 @@ function openDataPrivacyPopover(popover) {
   const repairIndex = makePopoverButton("Repair media index", shellBridge?.repairMediaIndex ? "Rebuild records" : "Desktop only", () => repairMediaIndexFromMenu(popover), !shellBridge?.repairMediaIndex);
 
   const providerPermissions = profileState.keywordProvider?.permissions || {};
+  const aiOptions = qwenProviderOptions();
   const providerRows = createDetailRows([
-    ["Keyword provider", profileState.keywordProvider?.modeLabel || "Local mock only"],
-    ["Consent", profileState.keywordProvider?.consentVersion || "provider-consent-v1"],
-    ["Image access", providerPermissions.imageAccess ? "Allowed" : "Off"],
-    ["Text access", providerPermissions.textAccess ? "Object text only" : "Off"],
+    ["Provider", profileState.keywordProvider?.activeProvider || "local-mock"],
+    ["Model", aiOptions.model],
+    ["Prompt", aiOptions.promptVersion],
+    ["Qwen key", aiOptions.apiKeyAvailable ? "Available" : "Not set"],
+    ["Image access", providerPermissions.imageAccess ? "Working copy only" : "Off"],
+    ["Text access", providerPermissions.textAccess ? "Keywords only" : "Off"],
     ["Network", providerPermissions.network ? "Allowed" : "Off"],
-    ["External AI", profileState.keywordProvider?.externalProviderEnabled ? "Enabled" : "Off by default"],
+    ["Auto keywords", aiAutoKeywordEnabled ? "On this window" : "Off"],
     ["Privacy", "Absolute paths omitted"]
   ]);
   const providerList = createProviderCapabilityList();
-  const aiProvider = makePopoverButton("External AI provider", "Disabled until explicit consent", null, true);
 
   const rebuildSearch = makePopoverButton("Rebuild search", shellBridge?.rebuildSearchIndex ? "Local index" : "Desktop only", () => rebuildSearchIndexFromMenu(popover), !shellBridge?.rebuildSearchIndex);
   const fixture = makePopoverButton("Developer fixture", shellBridge?.exportRestoreFixture ? "Export" : "Desktop only", () => exportRestoreFixtureFromMenu(popover), !shellBridge?.exportRestoreFixture);
@@ -1134,7 +1648,7 @@ function openDataPrivacyPopover(popover) {
   const localSection = createSettingsSection("Local Data", [localRows, verify], "Your board is stored locally in this device profile.");
   const backupSection = createSettingsSection("Backup / Restore", [backup, preview, importNewDay], "Backups omit absolute paths. Restore preview is read-only; import adds a separate day.");
   const mediaSection = createSettingsSection("Media Repair", [repairSummary, scanMedia, applyMedia, repairIndex]);
-  const aiSection = createSettingsSection("AI Privacy", [providerRows, providerList, aiProvider], "Keyword suggestions use a provider router. This build only runs local mock; external providers cannot be enabled yet.");
+  const aiSection = createSettingsSection("AI Privacy", [providerRows, createAiProviderSetupHint(), providerList], "AI controls live in More. This section only explains data access, model, prompt, and privacy boundaries.");
   const maintenanceSection = createSettingsSection("Maintenance", [rebuildSearch, fixture], "Developer-safe tools for rebuilding local read models and recovery fixtures.");
   const status = document.createElement("div");
   status.className = "export-status";
@@ -1149,7 +1663,7 @@ async function rebuildSearchIndexFromMenu(popover) {
     if (!result?.ok) throw new Error(result?.error || "Search index rebuild failed");
     saveState.textContent = "Search indexed";
     saveState.title = (result.indexed || 0) + " search rows";
-    openDataPrivacyPopover(popover);
+    refreshAiPopover(popover);
   } catch (error) {
     saveState.textContent = "Index failed";
     saveState.title = error?.message || "Search index rebuild failed";
@@ -1236,6 +1750,7 @@ async function importJsonAsNewDayFromMenu(popover) {
 }
 
 function openMorePopover(popover) {
+  popover.dataset.surface = "more";
   popover.innerHTML = "";
   const title = document.createElement("h2");
   title.textContent = "More";
@@ -1245,10 +1760,11 @@ function openMorePopover(popover) {
   const dragHarness = makePopoverButton("Drag Harness", `${state.dragHarness.length} samples`, () => openDragHarnessPopover(popover));
   const retrySaves = makePopoverButton("Retry failed saves", retryQueueCount() ? `${retryQueueCount()} queued` : "None", retryAllMutations, !retryQueueCount());
   const search = makePopoverButton("Search board", searchState.query ? `${searchState.results.length} matches` : "Ctrl / Cmd + F", () => openSearchPopover(popover));
-  const privacy = makePopoverButton("Data & Privacy", shellBridge ? "Backup / AI" : "Desktop only", null, !shellBridge);
+  const aiControls = createMoreAiControls(popover);
+  const privacy = makePopoverButton("Data & Privacy", shellBridge ? "Storage / privacy" : "Desktop only", null, !shellBridge);
   privacy.dataset.action = "data-privacy";
   privacy.addEventListener("click", (event) => { event.preventDefault(); event.stopPropagation(); openDataPrivacyPopover(popover); });
-  popover.append(title, search, retrySaves, always, dragHarness, privacy);
+  popover.append(title, aiControls, search, retrySaves, always, dragHarness, privacy);
 }
 function renderSearchResults(popover) {
   const list = popover.querySelector(".search-results");
@@ -1552,6 +2068,7 @@ function createImageObject(item) {
   object.classList.toggle("keywords-open", state.activeKeywordId === item.id);
   object.classList.toggle("capture-resolving", item.lifecycleState === "RESOLVING");
   object.classList.toggle("capture-localizing", item.lifecycleState === "LOCALIZING");
+  object.classList.toggle("ai-batch-current", aiBatchKeywordRunning && aiBatchKeywordStats.currentId === item.id);
   object.classList.toggle("capture-reference", item.lifecycleState === "REMOTE_REFERENCE");
   object.classList.toggle("capture-failed", item.lifecycleState === "FAILED");
   object.classList.toggle("capture-durable", item.lifecycleState === "DURABLE" || item.lifecycleState === "ORIGINAL_LOCAL");
@@ -1720,13 +2237,19 @@ function keywordGatewayRequest(item, providerId = profileState.keywordProvider?.
   return {
     provider: providerId,
     requestId: "kw-" + item.id + "-" + Date.now(),
+    promptVersion: item.aiKeywordPromptVersion || "keyword-prompt-v1",
+    locale: "en",
     object: {
       id: item.id,
       kind: item.kind || "image",
       sourceType: item.sourceType || "",
       sourceUrl: item.sourceUrl || item.url || "",
       note: item.note || "",
-      keywords: [...(item.keywords || [])]
+      keywords: [...(item.keywords || [])],
+      lifecycleState: item.lifecycleState || "",
+      assetId: item.assetId || "",
+      sha256: item.sha256 || "",
+      media: item.assetId ? { variants: { working: "app-media://asset/" + item.assetId + "?variant=working" } } : null
     }
   };
 }
@@ -1737,32 +2260,95 @@ function localMockKeywordCandidates(item, requestId = "kw-local-" + Date.now()) 
   const base = item.kind === "link" ? ["web reference", "source trail", "saved link"] : ["visual memory", "composition note", "material mood", "image reference"];
   const seen = new Set([...(item.keywords || []).map(cleanCandidateText), ...cloneKeywordCandidates(item.keywordCandidates).filter((candidate) => candidate.state === "dismissed").map((candidate) => cleanCandidateText(candidate.text))]);
   const values = [...base, item.sourceType || "", ...host, ...note, ...(item.keywords || []).map((keyword) => keyword + " variation")];
-  return values.map(cleanCandidateText).filter(Boolean).filter((text) => { if (seen.has(text)) return false; seen.add(text); return true; }).slice(0, AI_KEYWORD_MAX).map((text, index) => ({ id: requestId + "-cand-" + index, text, confidence: Number((0.82 - index * 0.04).toFixed(2)), source: "local-mock", provider: "local-mock", state: "suggested", createdAtUtc: new Date().toISOString() }));
+  return values.map(cleanCandidateText).filter(Boolean).filter((text) => { if (seen.has(text)) return false; seen.add(text); return true; }).slice(0, AI_KEYWORD_MAX).map((text, index) => ({ id: requestId + "-cand-" + index, text, confidence: Number((0.82 - index * 0.04).toFixed(2)), source: "local-mock", provider: "local-mock", promptVersion: "keyword-prompt-v1", state: "suggested", createdAtUtc: new Date().toISOString() }));
 }
 function visibleKeywordCandidates(item) { return cloneKeywordCandidates(item.keywordCandidates).filter((candidate) => candidate.state === "suggested"); }
+function readableAiKeywordError(error) {
+  const code = String(error || "").trim();
+  const labels = {
+    AI_JOB_INTERRUPTED: "AI was interrupted",
+    AI_MISSING_API_KEY: "Add Qwen API key",
+    AI_PROVIDER_AUTH_FAILED: "API key was rejected",
+    AI_PROVIDER_MODEL_NOT_FOUND: "Qwen model not found",
+    AI_IMAGE_NOT_DURABLE: "Image is not saved yet",
+    AI_WORKING_DERIVATIVE_MISSING: "Working image missing",
+    AI_PROVIDER_TIMEOUT: "Provider timeout",
+    AI_PROVIDER_RATE_LIMITED: "Rate limited",
+    AI_PROVIDER_SCHEMA_INVALID: "Provider output format failed",
+    AI_PROVIDER_REQUIRES_OPT_IN: "Enable Qwen first",
+    AI_PROVIDER_CONSENT_REQUIRED: "AI consent required",
+    AI_PROVIDER_DISABLED: "Provider disabled",
+    AI_PROVIDER_NETWORK_ERROR: "Network error"
+  };
+  return labels[code] || (code || "Keyword generation failed");
+}
+function aiKeywordErrorDetail(error) {
+  const code = String(error || "").trim();
+  const details = {
+    AI_JOB_INTERRUPTED: "The app closed or reloaded while this AI job was running. Retry will reuse this image and job context.",
+    AI_MISSING_API_KEY: "Set AESTHETICBOARD_QWEN_API_KEY or DASHSCOPE_API_KEY in the PowerShell session before starting the desktop app.",
+    AI_PROVIDER_AUTH_FAILED: "DashScope rejected the key. Check whether the key is correct, active, and allowed for this model.",
+    AI_PROVIDER_MODEL_NOT_FOUND: "DashScope did not accept the configured model name. Check AESTHETICBOARD_QWEN_MODEL or the Profile provider config.",
+    AI_IMAGE_NOT_DURABLE: "Wait until the image finishes saving locally, then retry.",
+    AI_WORKING_DERIVATIVE_MISSING: "The local working image copy is missing. Try repairing media or re-adding the image.",
+    AI_PROVIDER_TIMEOUT: "The provider took too long. Retry later or increase AESTHETICBOARD_QWEN_TIMEOUT_MS for testing.",
+    AI_PROVIDER_RATE_LIMITED: "The provider is rate limiting requests. Wait before retrying or reduce batch generation.",
+    AI_PROVIDER_SCHEMA_INVALID: "The provider returned text that did not match the expected keyword JSON shape.",
+    AI_PROVIDER_REQUIRES_OPT_IN: "Enable Qwen from More before making external AI requests.",
+    AI_PROVIDER_CONSENT_REQUIRED: "Qwen needs image and network access to run.",
+    AI_PROVIDER_DISABLED: "This provider is registered but cannot run in this build.",
+    AI_PROVIDER_NETWORK_ERROR: "The provider request failed before a valid keyword response was received."
+  };
+  return details[code] || "";
+}
 async function generateKeywordCandidatesForItem(item, regenerate = false) {
+  await refreshKeywordProviderState();
   const providerId = profileState.keywordProvider?.activeProvider || "local-mock";
+  if (providerId !== "local-mock" && !isAiKeywordImageReady(item)) { markAiKeywordWaitingForDurable(item, false); return; }
+  const options = qwenProviderOptions();
+  const request = keywordGatewayRequest(item, providerId);
+  const requestPromptVersion = request.promptVersion || "keyword-prompt-v1";
+  const jobKey = aiJobKeyFor({ objectId: item.id, assetId: item.assetId || item.id, provider: providerId, model: options.model, promptVersion: requestPromptVersion, locale: request.locale || "en" });
+  let job = upsertAiJob({ key: jobKey, objectId: item.id, dayCanvasId: state.activeDayId, assetId: item.assetId || "", provider: providerId, model: options.model, promptVersion: requestPromptVersion, locale: request.locale || "en", state: "queued", requestId: request.requestId });
   item.aiKeywordState = "pending";
   item.aiKeywordProvider = providerId;
+  item.aiKeywordJobId = job.id;
+  item.aiKeywordLastRunAtUtc = new Date().toISOString();
+  item.aiKeywordPromptVersion = requestPromptVersion;
+  item.aiKeywordInFlight = true;
+  item.aiKeywordRetryWhenDurable = false;
   if (regenerate) item.keywordCandidates = cloneKeywordCandidates(item.keywordCandidates).filter((candidate) => candidate.state === "accepted");
   renderCanvas();
-  const request = keywordGatewayRequest(item, providerId);
+  persistAiJob(job, true);
+  job = upsertAiJob({ ...job, state: "sending", startedAtUtc: item.aiKeywordLastRunAtUtc });
+  persistAiJob(job, false);
   try {
-    const response = shellBridge?.generateKeywordCandidates ? await shellBridge.generateKeywordCandidates(request) : { ok: true, candidates: localMockKeywordCandidates(item, request.requestId) };
+    job = upsertAiJob({ ...job, state: "waiting" });
+    persistAiJob(job, false);
+    const response = shellBridge?.generateKeywordCandidates ? await shellBridge.generateKeywordCandidates(request) : { ok: true, provider: providerId, requestId: request.requestId, candidates: localMockKeywordCandidates(item, request.requestId) };
+    if (latestAiJobForItem(item)?.state === "canceled") return;
     if (!response?.ok) throw new Error(response?.error || "KEYWORD_MOCK_FAILED");
     const dismissed = new Set(cloneKeywordCandidates(item.keywordCandidates).filter((candidate) => candidate.state === "dismissed").map((candidate) => candidate.text));
     const fresh = cloneKeywordCandidates(response.candidates).filter((candidate) => !dismissed.has(candidate.text) && !(item.keywords || []).includes(candidate.text));
-    item.keywordCandidates = [...cloneKeywordCandidates(item.keywordCandidates).filter((candidate) => ["accepted", "dismissed"].includes(candidate.state)), ...fresh].slice(0, AI_KEYWORD_HISTORY_MAX);
+    const responsePromptVersion = response.promptVersion || requestPromptVersion;
+    item.keywordCandidates = [...cloneKeywordCandidates(item.keywordCandidates).filter((candidate) => ["accepted", "dismissed"].includes(candidate.state)), ...fresh.map((candidate) => ({ ...candidate, promptVersion: candidate.promptVersion || responsePromptVersion }))].slice(0, AI_KEYWORD_HISTORY_MAX);
+    item.aiKeywordPromptVersion = responsePromptVersion;
     item.aiKeywordState = fresh.length ? "suggested" : "empty";
     item.aiKeywordError = "";
+    item.aiKeywordRetryWhenDurable = false;
+    item.aiKeywordInFlight = false;
+    job = upsertAiJob({ ...job, state: "succeeded", completedAtUtc: new Date().toISOString(), error: "" });
     state.activeKeywordId = item.id;
     renderCanvas();
-    persist({ type: "keyword.candidates", targetId: item.id, payload: { provider: response.provider || providerId, state: item.aiKeywordState, candidates: cloneKeywordCandidates(item.keywordCandidates) } });
+    persist({ immediate: true, mutations: [makeMutation("ai.job", { job: { ...job } }, item.id), makeMutation("keyword.candidates", { provider: response.provider || providerId, promptVersion: item.aiKeywordPromptVersion || response.promptVersion || requestPromptVersion, quality: response.quality || null, state: item.aiKeywordState, candidates: cloneKeywordCandidates(item.keywordCandidates), jobId: item.aiKeywordJobId || request.requestId, generatedAtUtc: item.aiKeywordLastRunAtUtc || response.generatedAtUtc || "" }, item.id)] });
   } catch (error) {
     item.aiKeywordState = "failed";
     item.aiKeywordError = error?.message || "Keyword generation failed";
+    item.aiKeywordInFlight = false;
+    item.aiKeywordRetryWhenDurable = false;
+    job = upsertAiJob({ ...job, state: "failed", completedAtUtc: new Date().toISOString(), error: item.aiKeywordError });
     renderCanvas();
-    persist({ type: "keyword.candidates", targetId: item.id, payload: { provider: providerId, state: "failed", error: item.aiKeywordError, candidates: cloneKeywordCandidates(item.keywordCandidates) } });
+    persist({ immediate: true, mutations: [makeMutation("ai.job", { job: { ...job } }, item.id), makeMutation("keyword.candidates", { provider: providerId, promptVersion: item.aiKeywordPromptVersion || requestPromptVersion, state: "failed", error: item.aiKeywordError, candidates: cloneKeywordCandidates(item.keywordCandidates), jobId: item.aiKeywordJobId || request.requestId, generatedAtUtc: item.aiKeywordLastRunAtUtc || "" }, item.id)] });
   }
 }
 function acceptKeywordCandidate(item, candidate, pin = false) {
@@ -1783,30 +2369,45 @@ function dismissKeywordCandidate(item, candidate) {
   renderCanvas();
   persist({ type: "keyword.dismiss", targetId: item.id, payload: { candidateId: candidate.id, keyword: candidate.text, candidates: cloneKeywordCandidates(item.keywordCandidates) } });
 }
+function dismissAllKeywordCandidates(item) {
+  const suggestions = visibleKeywordCandidates(item);
+  if (!suggestions.length) return;
+  const reviewedAtUtc = new Date().toISOString();
+  const suggestionIds = new Set(suggestions.map((candidate) => candidate.id));
+  item.keywordCandidates = cloneKeywordCandidates(item.keywordCandidates).map((entry) => suggestionIds.has(entry.id) ? { ...entry, state: "dismissed", reviewedAtUtc, dismissedAtUtc: reviewedAtUtc } : entry);
+  item.aiKeywordState = "reviewed";
+  renderCanvas();
+  persist({ type: "keyword.dismiss", targetId: item.id, payload: { candidateIds: [...suggestionIds], dismissAll: true, candidates: cloneKeywordCandidates(item.keywordCandidates) } });
+}
 function createKeywordLayer(item) {
   const layer = document.createElement("div");
   layer.className = "keyword-layer";
-  const keywords = item.keywords?.length ? item.keywords : [item.kind === "link" ? "link capture" : "image first"];
+  const keywords = Array.isArray(item.keywords) ? item.keywords.filter((keyword) => String(keyword || "").trim()) : [];
   const suggestions = visibleKeywordCandidates(item);
   const folded = document.createElement("button");
   folded.className = "keyword-folded";
   folded.type = "button";
-  folded.textContent = suggestions.length ? keywords[0] + " +" + Math.max(keywords.length - 1, 0) + " / " + suggestions.length + " suggested" : keywords[0] + " +" + Math.max(keywords.length - 1, 0);
+  folded.textContent = keywords.length ? (suggestions.length ? keywords[0] + " +" + Math.max(keywords.length - 1, 0) + " / " + suggestions.length + " suggested" : keywords[0] + " +" + Math.max(keywords.length - 1, 0)) : (suggestions.length ? suggestions.length + " suggested" : "No keywords yet");
   folded.title = "Expand keywords";
   folded.addEventListener("pointerdown", (event) => event.stopPropagation());
   folded.addEventListener("click", (event) => { event.stopPropagation(); state.activeKeywordId = state.activeKeywordId === item.id ? null : item.id; renderCanvas(); });
   const expanded = document.createElement("div");
   expanded.className = "keyword-expanded";
+  if (!keywords.length) {
+    const emptyKeyword = document.createElement("div");
+    emptyKeyword.className = "keyword-empty-state";
+    emptyKeyword.textContent = suggestions.length ? "Review suggestions below" : "No pinned keywords yet";
+    expanded.appendChild(emptyKeyword);
+  }
   keywords.forEach((keyword, index) => {
     const row = document.createElement("div");
     row.className = "keyword-chip" + (index === 0 ? " pinned" : "");
     const text = document.createElement("span");
     text.className = "keyword-text";
     text.textContent = keyword;
-    text.title = "Copy keyword, double click to pin";
+    text.title = keyword + "\nCopy keyword";
     text.addEventListener("pointerdown", (event) => event.stopPropagation());
     text.addEventListener("click", () => copyKeyword(keyword, expanded));
-    text.addEventListener("dblclick", () => pinKeyword(item, keyword));
     const pinButton = document.createElement("button");
     pinButton.type = "button";
     pinButton.className = "keyword-pin-button";
@@ -1829,7 +2430,8 @@ function createKeywordLayer(item) {
   const aiHead = document.createElement("div");
   aiHead.className = "ai-keyword-head";
   const aiTitle = document.createElement("span");
-  aiTitle.textContent = item.aiKeywordState === "pending" ? "Suggesting" : "AI suggestions";
+  const currentAiJob = latestAiJobForItem(item);
+  aiTitle.textContent = aiBatchKeywordRunning && aiBatchKeywordStats.currentId === item.id ? "Generating for day" : item.aiKeywordState === "pending" ? aiJobLabel(currentAiJob) || "Suggesting" : "AI suggestions";
   const generate = document.createElement("button");
   generate.type = "button";
   generate.textContent = suggestions.length ? "Regenerate" : "Suggest";
@@ -1838,25 +2440,67 @@ function createKeywordLayer(item) {
   generate.addEventListener("pointerdown", (event) => event.stopPropagation());
   generate.addEventListener("click", (event) => { event.stopPropagation(); generateKeywordCandidatesForItem(item, suggestions.length > 0); });
   aiHead.append(aiTitle, generate);
+  if (currentAiJob && ["queued", "sending", "waiting"].includes(currentAiJob.state)) {
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.textContent = "Cancel";
+    cancel.title = "Cancel this AI job on this image";
+    cancel.addEventListener("pointerdown", (event) => event.stopPropagation());
+    cancel.addEventListener("click", (event) => { event.stopPropagation(); cancelAiJobForItem(item); });
+    aiHead.appendChild(cancel);
+  }
   aiPanel.appendChild(aiHead);
   if (item.aiKeywordState === "failed") {
     const failed = document.createElement("span");
     failed.className = "ai-keyword-empty";
-    failed.textContent = "Keyword provider failed";
-    failed.title = item.aiKeywordError || "";
+    failed.textContent = readableAiKeywordError(item.aiKeywordError);
+    failed.title = [
+      item.aiKeywordError ? aiKeywordErrorDetail(item.aiKeywordError) : "",
+      item.aiKeywordError ? "Error code: " + item.aiKeywordError : "",
+      item.aiKeywordProvider ? "Provider: " + item.aiKeywordProvider : "",
+      item.aiKeywordPromptVersion ? "Prompt: " + item.aiKeywordPromptVersion : ""
+    ].filter(Boolean).join("\\n");
     aiPanel.appendChild(failed);
+    const failureActions = document.createElement("div");
+    failureActions.className = "ai-job-actions";
+    const retry = document.createElement("button");
+    retry.type = "button";
+    retry.textContent = "Retry AI";
+    retry.addEventListener("pointerdown", (event) => event.stopPropagation());
+    retry.addEventListener("click", (event) => { event.stopPropagation(); retryAiJobForItem(item); });
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.textContent = "Cancel";
+    cancel.addEventListener("pointerdown", (event) => event.stopPropagation());
+    cancel.addEventListener("click", (event) => { event.stopPropagation(); cancelAiJobForItem(item); });
+    failureActions.append(retry, cancel);
+    aiPanel.appendChild(failureActions);
   } else if (!suggestions.length) {
     const empty = document.createElement("span");
     empty.className = "ai-keyword-empty";
-    empty.textContent = item.aiKeywordState === "pending" ? "Local mock is preparing candidates" : "No unreviewed suggestions";
+    empty.textContent = item.aiKeywordState === "pending" ? "AI is preparing candidates" : "No unreviewed suggestions";
     aiPanel.appendChild(empty);
+  }
+  if (suggestions.length) {
+    const dismissAll = document.createElement("button");
+    dismissAll.type = "button";
+    dismissAll.className = "ai-dismiss-all";
+    dismissAll.textContent = "Dismiss all";
+    dismissAll.title = "Dismiss all unreviewed suggestions on this image";
+    dismissAll.addEventListener("pointerdown", (event) => event.stopPropagation());
+    dismissAll.addEventListener("click", (event) => { event.stopPropagation(); dismissAllKeywordCandidates(item); });
+    aiPanel.appendChild(dismissAll);
   }
   suggestions.forEach((candidate) => {
     const row = document.createElement("div");
     row.className = "ai-keyword-candidate";
     const text = document.createElement("span");
+    text.className = "ai-candidate-text";
     text.textContent = candidate.text;
-    text.title = "Suggested keyword. Accept or pin to make it searchable.";
+    text.title = candidateDetailTitle(candidate);
+    const detail = document.createElement("small");
+    detail.className = "ai-candidate-detail";
+    detail.textContent = [candidate.provider || candidate.source || "AI", candidate.promptVersion || "", typeof candidate.confidence === "number" ? Math.round(candidate.confidence * 100) + "%" : ""].filter(Boolean).join(" / ");
     const actions = document.createElement("span");
     actions.className = "ai-keyword-actions";
     const accept = document.createElement("button");
@@ -1864,18 +2508,16 @@ function createKeywordLayer(item) {
     accept.textContent = "Accept";
     accept.addEventListener("pointerdown", (event) => event.stopPropagation());
     accept.addEventListener("click", (event) => { event.stopPropagation(); acceptKeywordCandidate(item, candidate, false); });
-    const pin = document.createElement("button");
-    pin.type = "button";
-    pin.textContent = "Pin";
-    pin.addEventListener("pointerdown", (event) => event.stopPropagation());
-    pin.addEventListener("click", (event) => { event.stopPropagation(); acceptKeywordCandidate(item, candidate, true); });
     const dismiss = document.createElement("button");
     dismiss.type = "button";
     dismiss.textContent = "Dismiss";
     dismiss.addEventListener("pointerdown", (event) => event.stopPropagation());
     dismiss.addEventListener("click", (event) => { event.stopPropagation(); dismissKeywordCandidate(item, candidate); });
-    actions.append(accept, pin, dismiss);
-    row.append(text, actions);
+    actions.append(accept, dismiss);
+    const copy = document.createElement("span");
+    copy.className = "ai-candidate-copy";
+    copy.append(text, detail);
+    row.append(copy, actions);
     aiPanel.appendChild(row);
   });
   const keywordConflict = createKeywordConflictDetail(item);
@@ -1888,17 +2530,22 @@ function createQuickNote(item) {
   const note = document.createElement("section");
   note.className = "quick-note";
   note.classList.toggle("expanded", state.expandedNoteId === item.id);
+  note.addEventListener("pointerdown", (event) => event.stopPropagation());
+  note.addEventListener("click", (event) => { if (!item.note && !note.classList.contains("editing")) { event.preventDefault(); event.stopPropagation(); editNote(note, item); } });
   const text = document.createElement("p");
   text.className = "note-text";
   text.textContent = item.note || "";
   text.addEventListener("pointerdown", (event) => event.stopPropagation());
-  text.addEventListener("dblclick", () => editNote(note, item));
+  text.addEventListener("dblclick", (event) => { event.preventDefault(); event.stopPropagation(); editNote(note, item); });
   const editor = document.createElement("textarea");
   editor.className = "note-editor";
   editor.value = item.note || "";
   editor.ariaLabel = "Edit quick note";
   editor.placeholder = "Quick note";
   editor.addEventListener("pointerdown", (event) => event.stopPropagation());
+  editor.addEventListener("click", (event) => event.stopPropagation());
+  editor.addEventListener("focus", () => note.classList.add("editing", "expanded"));
+  editor.addEventListener("input", () => { item.note = editor.value; });
   editor.addEventListener("blur", () => { item.note = editor.value.trim(); note.classList.remove("editing"); renderCanvas(); persist({ type: "object.note", targetId: item.id, payload: { note: item.note } }); });
   editor.addEventListener("keydown", (event) => { if (event.key === "Escape" || (event.key === "Enter" && (event.metaKey || event.ctrlKey))) editor.blur(); });
   const toggle = document.createElement("button");
@@ -1906,16 +2553,20 @@ function createQuickNote(item) {
   toggle.type = "button";
   toggle.textContent = state.expandedNoteId === item.id ? "Collapse" : (item.note ? "Expand" : "Add Note");
   toggle.addEventListener("pointerdown", (event) => event.stopPropagation());
-  toggle.addEventListener("click", () => { if (!item.note) return editNote(note, item); state.expandedNoteId = state.expandedNoteId === item.id ? null : item.id; renderCanvas(); });
+  toggle.addEventListener("click", (event) => { event.preventDefault(); event.stopPropagation(); if (!item.note) return editNote(note, item); state.expandedNoteId = state.expandedNoteId === item.id ? null : item.id; renderCanvas(); });
   note.append(text, editor, toggle);
   return note;
 }
 
 function editNote(note, item) {
+  if (!note) return;
   state.selectedId = item.id;
+  state.expandedNoteId = item.id;
   note.classList.add("editing", "expanded");
   const editor = note.querySelector(".note-editor");
-  requestAnimationFrame(() => { editor.focus(); editor.setSelectionRange(editor.value.length, editor.value.length); });
+  if (!editor) return;
+  editor.value = item.note || "";
+  requestAnimationFrame(() => { editor.focus({ preventScroll: true }); editor.setSelectionRange(editor.value.length, editor.value.length); });
 }
 
 async function copyKeyword(keyword, container) {
@@ -2291,7 +2942,7 @@ function createCapturedImage(src, naturalSize, sourceType, worldPoint = null, op
     width,
     z: Math.max(...items().map((value) => value.z), 0) + 1,
     locked: false,
-    keywords: sourceType === "remote-url" ? ["remote image", "image first", "url capture", "visual capture", "quiet archive"] : sourceType === "browser-drag" ? ["browser drag", "image first", "drop position", "visual capture", "quiet archive"] : ["clipboard paste", "image first", "unsorted reference", "visual capture", "quiet archive"],
+    keywords: [],
     note: "",
     lifecycleState: options.lifecycleState || "READY",
     captureError: "",
@@ -2381,6 +3032,7 @@ function applyLocalizedCaptureResponse(item, response) {
   item.src = response.rendererSrc || (response.assetId ? `app-media://asset/${response.assetId}?variant=working` : item.src);
   item.lifecycleState = response.persistence?.ok ? "DURABLE" : "ORIGINAL_LOCAL";
   item.captureError = response.persistence?.ok ? "" : (response.persistence?.error || "SQLite unavailable");
+  if (response.persistence?.ok) clearAiDurableWait(item);
   saveState.textContent = response.persistence?.ok ? "Saved" : "Saved local";
 }
 async function localizeRemoteCapture(item, url, naturalSize, candidateManifest = {}) {
@@ -2416,6 +3068,7 @@ async function localizeRemoteCapture(item, url, naturalSize, candidateManifest =
   }
   renderCanvas();
   persist({ type: "capture.lifecycle", targetId: item.id, payload: { state: item.lifecycleState, assetId: item.assetId || "", error: item.captureError || "", captureJobId: item.captureJobId || item.id, src: item.src } });
+  maybeAutoGenerateKeywords(item);
 }
 async function commitLocalCapture(item, dataUrl, naturalSize, sourceType, candidateManifest = {}) {
   if (!shellBridge?.commitCapturedMedia) return;
@@ -2464,6 +3117,7 @@ async function commitLocalCapture(item, dataUrl, naturalSize, sourceType, candid
     item.src = response.rendererSrc || (response.assetId ? `app-media://asset/${response.assetId}?variant=working` : item.src);
     item.lifecycleState = response.persistence?.ok ? "DURABLE" : "ORIGINAL_LOCAL";
     item.captureError = response.persistence?.ok ? "" : (response.persistence?.error || "SQLite unavailable");
+    if (response.persistence?.ok) clearAiDurableWait(item);
     saveState.textContent = response.persistence?.ok ? "Saved" : "Saved local";
   } catch (error) {
     item.lifecycleState = "FAILED";
@@ -2472,6 +3126,7 @@ async function commitLocalCapture(item, dataUrl, naturalSize, sourceType, candid
   }
   renderCanvas();
   persist({ type: "capture.lifecycle", targetId: item.id, payload: { state: item.lifecycleState, assetId: item.assetId || "", error: item.captureError || "", captureJobId: item.captureJobId || item.id } });
+  maybeAutoGenerateKeywords(item);
 }
 
 async function captureFile(file, sourceType, worldPoint) {
@@ -2670,7 +3325,7 @@ function openTrashPopover(popover) {
 function exportSafeDayId() { return String(state.activeDayId || "day").replace(/[^0-9a-z-]/gi, "-"); }
 function exportFileStamp() { return new Date().toISOString().replace(/[:.]/g, "-"); }
 function sanitizeExportItem(item) {
-  const copy = { id: item.id, kind: item.kind || "image", x: item.x, y: item.y, width: item.width, z: item.z, locked: Boolean(item.locked), note: item.note || "", keywords: [...(item.keywords || [])], keywordCandidates: cloneKeywordCandidates(item.keywordCandidates), aiKeywordState: item.aiKeywordState || "idle", lifecycleState: item.lifecycleState || "READY", mediaResolution: item.mediaResolution || "", importedFromId: item.importedFromId || "", importBatchId: item.importBatchId || "", mediaRepairState: item.mediaRepairState || "", sourceType: item.sourceType || "", sourceUrl: item.sourceUrl || "", url: item.url || "", label: item.label || "", assetId: item.assetId || "", sha256: item.sha256 || "", originalRelpath: item.originalRelpath || "" };
+  const copy = { id: item.id, kind: item.kind || "image", x: item.x, y: item.y, width: item.width, z: item.z, locked: Boolean(item.locked), note: item.note || "", keywords: [...(item.keywords || [])], keywordCandidates: cloneKeywordCandidates(item.keywordCandidates), aiKeywordState: item.aiKeywordState || "idle", aiKeywordProvider: item.aiKeywordProvider || "local-mock", aiKeywordJobId: item.aiKeywordJobId || "", aiKeywordLastRunAtUtc: item.aiKeywordLastRunAtUtc || "", aiKeywordPromptVersion: item.aiKeywordPromptVersion || "keyword-prompt-v1", lifecycleState: item.lifecycleState || "READY", mediaResolution: item.mediaResolution || "", importedFromId: item.importedFromId || "", importBatchId: item.importBatchId || "", mediaRepairState: item.mediaRepairState || "", sourceType: item.sourceType || "", sourceUrl: item.sourceUrl || "", url: item.url || "", label: item.label || "", assetId: item.assetId || "", sha256: item.sha256 || "", originalRelpath: item.originalRelpath || "" };
   if (item.assetId) copy.media = { assetId: item.assetId, variants: { original: "app-media://asset/" + item.assetId + "?variant=original", working: "app-media://asset/" + item.assetId + "?variant=working", thumbnail: "app-media://asset/" + item.assetId + "?variant=thumbnail" } };
   if (item.src && !/^[a-z]:\\|^\\\\/i.test(item.src)) copy.src = item.src;
   return copy;
@@ -2828,6 +3483,8 @@ canvas.addEventListener("pointerdown", (event) => {
 });
 document.addEventListener("keydown", handleGlobalKeydown);
 document.addEventListener("click", (event) => { if (!event.target.closest(".popover,.action-bar,.view-mode-selector,.view-controls")) closePopovers(); });
+window.addEventListener("blur", () => disableAiAutoKeywords("window-left"));
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") disableAiAutoKeywords("window-left"); });
 
 initializeShellBridge().finally(() => {
   renderChrome();
