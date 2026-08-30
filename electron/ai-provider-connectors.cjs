@@ -201,7 +201,7 @@ function qwenEffectiveOptions(config = {}, options = {}) {
     chatCompletionsUrl: qwenChatCompletionsUrl(baseUrl),
     timeoutMs,
     apiKeyAvailable: Boolean(qwenApiKey(env)),
-    apiKeySource: env.AESTHETICBOARD_QWEN_API_KEY ? 'AESTHETICBOARD_QWEN_API_KEY' : env.DASHSCOPE_API_KEY ? 'DASHSCOPE_API_KEY' : 'not set',
+    apiKeySource: env.AESTHETICBOARD_QWEN_API_KEY ? (env.AESTHETICBOARD_QWEN_API_KEY_SOURCE || 'AESTHETICBOARD_QWEN_API_KEY') : env.DASHSCOPE_API_KEY ? 'DASHSCOPE_API_KEY' : 'not set',
     modelSource: env.AESTHETICBOARD_QWEN_MODEL ? 'AESTHETICBOARD_QWEN_MODEL' : providerOptions.model ? 'profile config' : 'default',
     baseUrlSource: env.AESTHETICBOARD_QWEN_BASE_URL ? 'AESTHETICBOARD_QWEN_BASE_URL' : providerOptions.baseUrl ? 'profile config' : 'default',
     timeoutSource: env.AESTHETICBOARD_QWEN_TIMEOUT_MS ? 'AESTHETICBOARD_QWEN_TIMEOUT_MS' : providerOptions.timeoutMs ? 'profile config' : 'default'

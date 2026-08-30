@@ -58,6 +58,34 @@ Implemented slices:
 | 44 | Done | Data & Privacy can scan a chosen folder, preview SHA-256 media matches, and apply confirmed batch relinks. |
 | 45 | Done | Provider capability/consent copy is visible while external provider settings remain disabled and unenforceable by mutation. |
 
+## Performance Package - First 6 Tasks
+
+Goal: make boards with hundreds of images stay usable instead of loading, decoding, saving, capturing, and AI-processing everything at once.
+
+Completed in this pass:
+
+- Canvas Object Virtualization: Day Canvas now renders full objects near the current camera and keeps distant objects as lightweight placeholders once the board is large. Selected objects, active keyword panels, failed saves, failed AI, and search matches still render fully.
+- Image Lazy Loading And Decode Queue: image elements now use lazy/async decoding and a small render queue, so opening a crowded board does not ask the browser to decode every image at the same time.
+- Thumbnail-First Rendering: zoomed-out boards prefer thumbnail variants, then fall back to working/original image URLs when needed.
+- Bulk Import / Capture Queue: multi-file drops now queue image captures with limited concurrency and small gaps instead of starting every file commit together.
+- Persistence Backpressure: renderer save calls are coalesced before sending to the persistence worker; high-frequency camera/object/AI mutations keep the latest state instead of creating avoidable save pressure.
+- AI Queue Throttling For Large Boards: Generate day now limits one run to a bounded set of eligible images, spaces requests further apart, and reports deferred images as skipped/later work instead of flooding Qwen.
+
+Plain-language testing checklist:
+
+- Drop 20-50 local images at once. The board should show queued/importing feedback, remain responsive, and eventually mark images as local/durable without freezing.
+- Zoom far out on a crowded board. Images should still be visible through lighter thumbnails, and zoom/pan should feel smoother.
+- Pan far away and back on a board with many objects. Nearby objects should appear normally; distant objects should not slow down the whole canvas.
+- Move or resize an object several times quickly. The visible object should stay responsive and Saved/Needs retry should still reflect ACK state.
+- Run Generate day on a large board with Qwen enabled. It should process a limited batch, show progress, and avoid sending every eligible image at once.
+
+Continued in the next pass:
+
+- Viewport refresh after pan/zoom: when the user pans or zooms around a large board, lightweight placeholders are refreshed back into full objects near the new camera position.
+- Decode queue robustness: image loading now avoids duplicate queued sources and has a timeout so a stuck image does not block the rest of the queue.
+- Import queue feedback: bulk image drops now show active/queued import counts and then return to Saved when the queue is clear.
+- Render counters: the board keeps internal rendered/virtual object counts for later diagnostics without showing noisy debug UI to the user.
+
 ## Current Progress Sync - 2026-08-30 Evening
 
 The product is now past the core local-first board foundation and has entered the concrete AI keyword introduction stage.
@@ -133,6 +161,54 @@ Quick verification:
 
 - `cmd /c npm run check` should still pass after hygiene edits.
 - `git status --short` should no longer show `不上传_开发文档/` as untracked noise.
+
+## Scale Test Harness And Large Day Overview - 2026-08-30
+
+Goal: make it easy to test hundreds of references and give crowded days a lighter way to browse without forcing every image to render as a full board object.
+
+Completed in this pass:
+
+- More now includes a local Scale Test Harness: add 120 test references, add 300 stress references, and clear generated test references.
+- Scale samples use project-local reference photos and are marked as test fixtures, so they can be removed without touching real captured objects.
+- Large day overview is available from More and shows the current day as a lightweight thumbnail grid with counts for refs/images/links.
+- Clicking an overview tile returns to Day Canvas, selects that object, and moves the camera to it instead of moving the object itself.
+- Weekly/Monthly remain unchanged; Large Overview is treated as a Day helper view, so the main Day / Weekly / Monthly selector still reads correctly.
+
+Plain-language manual test:
+
+- Open More, click Add scale samples, then pan/zoom the normal Day Canvas. The page should stay usable and distant objects should become lighter placeholders.
+- Open More, click Large day overview. You should see a scrollable thumbnail grid for the current day instead of hundreds of full cards.
+- Click any tile in the overview. It should jump back to Day Canvas and center that item.
+- Add Stress scale samples if you want a heavier test, then use Clear scale samples to remove only the generated test references.
+
+Why it matters:
+
+- Without the harness, testing a large board requires manually importing hundreds of files every time.
+- Without overview mode, a very crowded day forces users to pan around spatially even when they only want to quickly find one object.
+
+## Memory And Cache Budget / Large Export Guard - 2026-08-31
+
+Goal: keep very large days from overloading the renderer or export path when users test or import hundreds of images.
+
+Completed in this pass:
+
+- Added an active image memory budget so the canvas keeps nearby/selected images loaded and defers far-away image sources when too many image elements are alive.
+- Added a capped image decode queue so a crowded board cannot keep piling up decode work faster than the browser can process it.
+- Large Day Overview now lazy-loads thumbnails and defers thumbnails far down the scroll area until the user scrolls near them.
+- Full-day PNG export now shows a clear guard summary in Download / Share and blocks risky exports before forcing every object to render.
+- Electron main process now repeats the full-day guard with the same limits, so oversized export requests are blocked even if they bypass the renderer UI.
+
+Manual test:
+
+- Use More -> Add scale samples and Stress scale samples, then pan and zoom. Nearby images should load, distant ones can stay light/deferred, and the board should remain usable.
+- Open More -> Large day overview and scroll. Thumbnails near the viewport should appear first; far-away thumbnails should not all load at once.
+- Open Download / Share. Full-day PNG should show a size/ref summary when safe, or a guarded status when the day is too large.
+- With more than 180 refs on the current day, Export full-day PNG should fail locally with a clear message instead of freezing the app.
+
+Why it matters:
+
+- Without the memory/cache budget, hundreds of images can keep too many decoded image surfaces alive and make normal interaction feel heavy.
+- Without the export guard, a full-day PNG can force a huge render all at once and risk a stuck window or failed desktop capture.
 
 ## Current Architecture Reality
 
@@ -580,3 +656,150 @@ Manual test checklist:
 2. Confirm there is no usable GPT-5.7 Luna enable button in More.
 3. Keep Qwen behavior unchanged: Enable Qwen / Turn AI off should still only affect Qwen/local mock.
 4. If a stale Profile config names GPT-5.7 Luna, app state should fall back to local mock instead of trying a network call.
+
+### AI Task 19: AI Auto Keyword Experience Polish
+
+Status: Done for first pass.
+
+What changed:
+
+- When Qwen is enabled and Auto keywords is turned on, newly added images are queued for keyword suggestions after they become Durable.
+- Images that are still saving no longer show a hard keyword failure. They show a local waiting state first, then continue automatically once local saving finishes.
+- Auto keywords is session-only: leaving or hiding the window turns Auto off, while any completed suggestions, accepted keywords, and pinned keywords remain saved.
+- More now shows Auto as a clearer state: Off, On this window, Running, Waiting for images, or Paused during day batch.
+- Auto generation uses a small single-session queue so new drops do not fire a burst of provider calls at the same time.
+
+Plain-language value:
+
+Auto means the user can turn AI on once, drop images, and let the app prepare suggestions without clicking Suggest on every image. It still does not approve keywords by itself.
+
+Manual test checklist:
+
+1. Open More, Enable Qwen, then turn on Auto keywords.
+2. Drop or paste a new image. While it is saving, the image should say Waiting for image save instead of a provider failure.
+3. After the image becomes Durable, it should automatically move into AI generation and then show suggestions.
+4. Leave the app window or switch away. Reopen More and confirm Auto is Off, while already generated suggestions remain.
+5. Accept or pin one suggestion and confirm it still behaves like normal approved keywords.
+
+### AI Task 20: AI Batch Throttle And Queue Protection
+
+Status: Done for first pass.
+
+What changed:
+
+- Generate day processes eligible Durable images one at a time with a delay between provider calls.
+- Images that already have accepted/pinned keywords or unreviewed suggestions are skipped so the same batch does not keep regenerating duplicates.
+- Stop day AI stops tasks that have not started yet. The currently running request may finish, and completed suggestions are preserved.
+- Batch progress keeps per-image ownership: the current image is highlighted locally, failures stay on the affected image, and Retry remains object-local.
+- Batch status in More now separates Auto status from Day queue status.
+
+Plain-language value:
+
+Generate day can slowly work through a large day without overwhelming the app or the API. It should feel like a careful queue, not a firehose.
+
+Manual test checklist:
+
+1. Add several Durable images with no accepted keywords.
+2. Enable Qwen, then click Generate day.
+3. Confirm only one image appears to be processing at a time.
+4. Click Stop day AI. Not-yet-started images should stop, while completed suggestions remain visible.
+5. Run Generate day again. Images that already have unreviewed suggestions should not duplicate their candidates.
+6. Restart and confirm completed suggestions remain, and the same images are not regenerated just because the app reopened.
+
+### AI Task 21: AI Panel Interaction Final Cleanup
+
+Status: Done for first pass.
+
+Goal:
+
+Make the AI controls feel like a finished product surface instead of a settings/debug panel.
+
+Plain-language value:
+
+The user should be able to answer three questions quickly: Is AI on? What will it do? What can I do next?
+
+Completed in this pass:
+
+- More -> AI Keywords now reads as a compact control surface: short status rows plus Enable/Disable Qwen, Auto keywords, Generate day/Stop day AI, and Test connection.
+- Button disabled states now carry practical reasons such as No API key, Enable Qwen first, Qwen is not ready, or No Durable images need AI.
+- Data & Privacy -> AI Privacy keeps the longer provider/model/prompt/key-source/data-access details instead of duplicating every action from More.
+- Object-level AI states remain local to the image: Waiting for image save, queued/sending/waiting, suggestions ready, failed, canceled, retry.
+- Candidate review remains simple: Accept, Dismiss, Dismiss all; Pin remains on accepted keyword rows.
+
+Acceptance:
+
+- More is understandable without reading the docs.
+- Data & Privacy explains provider/data access without duplicating every action.
+- AI action buttons never appear active when they cannot work.
+- No generated suggestion becomes trusted search metadata until the user accepts or pins it.
+
+### AI Task 23: Formal API Key Storage Design
+
+Status: Done for first pass.
+
+Goal:
+
+Move from development-only PowerShell environment variables toward a desktop-safe key storage path without exposing secrets to the renderer.
+
+What changed:
+
+- Added a main-process API key store helper for Qwen that can encrypt a saved key with Electron safeStorage.
+- Added Data & Privacy actions to save a Qwen key from a local text/key/env file and to clear a saved key.
+- The renderer still only receives safe status: Missing, Available, Saved, source, and secretVisibleToRenderer=false.
+- Stored key wins over development environment variables; environment variables remain as fallback for development.
+- Qwen diagnostics can now report secure storage as the key source without showing the key value.
+
+Manual test checklist:
+
+1. Create a small local text file containing only the Qwen key or AESTHETICBOARD_QWEN_API_KEY=value.
+2. Open Data & Privacy -> AI Privacy -> Save Qwen key and choose that file.
+3. More should show Key as Saved, and Data & Privacy should show Key source as secure storage.
+4. Run Test connection after enabling Qwen.
+5. Click Clear saved key. If no environment key is present, More should go back to Missing.
+6. Confirm exports/backups/logs never show the key value.
+
+### AI Task 24: Real AI QA Regression Pack
+
+Status: Done for first pass.
+
+Goal:
+
+Make real Qwen testing repeatable after changes to AI panels, queues, storage, search, and recovery.
+
+What changed:
+
+- Added docs/AI_REAL_QA_REGRESSION.md as the manual real-Qwen regression pack.
+- The existing no-network automated check now covers secure key storage helpers, renderer-safe key status, More AI panel readiness copy, and Data & Privacy key actions.
+- Real API testing remains manual and never asks the user to reveal the API key.
+- The QA pack separates no-network checks from real Qwen smoke tests, Auto keywords, Generate day, failure paths, and restart recovery.
+
+Manual test checklist:
+
+1. Run npm run check for no-network regression.
+2. Run the real-Qwen smoke test from docs/AI_REAL_QA_REGRESSION.md only when a valid key is configured.
+3. Test Enable Qwen, Test connection, Suggest, Auto keywords, Generate day, Stop day AI, Retry, Cancel, Accept, Dismiss, Pin, Search, and restart recovery in that order.
+4. Record real API failures by provider/model/prompt version and local error message, never by pasting the key.
+## Current Progress Sync - 2026-08-31 AI Key Storage And QA
+
+This sync captures the current working state before opening the next PR.
+
+Completed since the previous AI checkpoint:
+
+- AI Task 19: Auto keywords now uses a session queue. New images wait for Durable state first, then generate suggestions automatically while Auto is enabled.
+- AI Task 20: Generate day is throttled and queue-protected. It runs one image at a time, preserves completed suggestions, stops not-yet-started work, and skips images that already have accepted keywords or unreviewed suggestions.
+- AI Task 21: More now acts as the short AI control panel, while Data & Privacy holds provider/model/prompt/key/privacy details.
+- AI Task 23: Qwen API keys can be saved through desktop-side secure storage from a local key file. Renderer only receives safe key status, never the secret value.
+- AI Task 24: Added a real-Qwen QA regression pack and no-network checks for key storage, AI panel readiness copy, provider boundaries, candidate indexing, and secret leakage prevention.
+- Large-board safety work remains in place: object virtualization, image/cache budget, capture queue, large overview mode, and full-day export guards.
+
+Current QA baseline:
+
+- npm run check passes, including AI Task 19/20/21/23/24 checks.
+- Real Qwen testing is still manual and should use the desktop app without exposing the key.
+- docs/ contains local QA/setup documents; only include them in PRs when explicitly intended.
+
+Git/PR note:
+
+- Product code, Electron helpers, automated checks, and Project Status are ready for commit.
+- GitHub CLI is installed at C:\Program Files\GitHub CLI\gh.exe, but the active GitHub token is invalid in this shell. Re-authentication is required before gh pr create can succeed.
+

@@ -8,6 +8,19 @@ const CAPTURE_MICRO_OFFSET = 24;
 const TRASH_FEEDBACK_MS = 1200;
 const DENSE_ITEM_THRESHOLD = 24;
 const ZOOMED_OUT_THRESHOLD = 0.62;
+const VIRTUAL_RENDER_THRESHOLD = 80;
+const VIRTUAL_RENDER_PADDING = 900;
+const IMAGE_DECODE_CONCURRENCY = 4;
+const IMAGE_DECODE_QUEUE_MAX = 160;
+const ACTIVE_IMAGE_ELEMENT_BUDGET = 96;
+const LARGE_OVERVIEW_THUMB_BUDGET = 180;
+const MEMORY_BUDGET_SWEEP_MS = 240;
+const FULL_DAY_EXPORT_MAX_PIXELS = 42 * 1000 * 1000;
+const FULL_DAY_EXPORT_MAX_DIMENSION = 9000;
+const FULL_DAY_EXPORT_MAX_OBJECTS = 180;
+const CAPTURE_QUEUE_CONCURRENCY = 3;
+const CAPTURE_QUEUE_BATCH_GAP_MS = 90;
+const AI_BATCH_KEYWORD_MAX_PER_RUN = 36;
 const DRAG_HARNESS_LIMIT = 30;
 const TEXT_PREVIEW_LIMIT = 140;
 const AI_KEYWORD_MAX = 8;
@@ -58,6 +71,8 @@ const state = loadState();
 let dragIntent = null;
 let saveTimer = 0;
 let latestPersistenceRequest = 0;
+let pendingPersistenceMutations = [];
+let pendingPersistenceImmediate = false;
 let lastAckRevision = Number(state.persistenceRevision || 0);
 let searchState = { open: false, query: "", results: [], selectedIndex: 0, source: "renderer" };
 let durableSearchRequest = 0;
@@ -66,11 +81,21 @@ let conflictState = { active: false, message: "" };
 let mediaRelinkBatchState = null;
 let aiAutoKeywordEnabled = false;
 let aiAutoKeywordRunning = false;
+const aiAutoKeywordQueue = [];
+const aiAutoKeywordQueuedIds = new Set();
 let aiBatchKeywordRunning = false;
 let aiBatchStopRequested = false;
 let aiBatchKeywordStats = { total: 0, completed: 0, failed: 0, skipped: 0, currentId: "", startedAtUtc: "", stopped: false };
 const AI_AUTO_KEYWORD_BATCH_LIMIT = 6;
-const AI_BATCH_KEYWORD_DELAY_MS = 850;
+const AI_AUTO_KEYWORD_DELAY_MS = 650;
+const AI_BATCH_KEYWORD_DELAY_MS = 1200;
+let imageDecodeActive = 0;
+const imageDecodeQueue = [];
+let captureQueueActive = 0;
+const captureQueue = [];
+let virtualRenderTimer = 0;
+let lastVirtualRenderKey = "";
+let memoryBudgetTimer = 0;
 
 function startOfDay(date) { return new Date(date.getFullYear(), date.getMonth(), date.getDate()); }
 function padDatePart(value) { return String(value).padStart(2, "0"); }
@@ -201,7 +226,7 @@ function normalizeState(value) {
       entry.item.keywordCandidates = cloneKeywordCandidates(entry.item.keywordCandidates);
     });
   });
-  value.viewMode = ["day", "weekly", "monthly"].includes(value.viewMode) ? value.viewMode : "day";
+  value.viewMode = ["day", "weekly", "monthly", "large"].includes(value.viewMode) ? value.viewMode : "day";
   value.selectedId ??= null;
   value.activeKeywordId ??= null;
   value.expandedNoteId ??= null;
@@ -303,7 +328,7 @@ function applyCaptureRecovery(recovery) {
 
 function snapshotForPersistence() {
   return JSON.parse(JSON.stringify({ ...state, persistenceRevision: lastAckRevision }, (key, value) => {
-    if (["pendingMutationIds", "mutationError", "pendingDataUrl", "aiKeywordInFlight"].includes(key)) return undefined;
+    if (["pendingMutationIds", "mutationError", "pendingDataUrl", "aiKeywordInFlight", "aiKeywordAutoQueued"].includes(key)) return undefined;
     return value;
   }));
 }
@@ -441,19 +466,37 @@ function settleMutations(mutationIds = [], error = "") {
   });
 }
 
+function coalescePersistenceMutations(mutations) {
+  const keepLatestTypes = new Set(["camera.update", "object.move", "object.resize", "keyword.candidates", "ai.job"]);
+  const latestByKey = new Map();
+  const result = [];
+  mutations.forEach((mutation) => {
+    const key = keepLatestTypes.has(mutation.type) ? [mutation.dayCanvasId || state.activeDayId, mutation.targetId || "board", mutation.type].join("|") : "";
+    if (!key) { result.push(mutation); return; }
+    if (latestByKey.has(key)) result[latestByKey.get(key)] = mutation;
+    else { latestByKey.set(key, result.length); result.push(mutation); }
+  });
+  return result;
+}
+
 function persist(input = {}) {
   const request = normalizePersistInput(input);
-  saveState.textContent = "Saving";
+  saveState.textContent = pendingPersistenceMutations.length > 24 ? "Saving queue" : "Saving";
   markMutationsPending(request.mutations);
+  pendingPersistenceMutations = coalescePersistenceMutations([...pendingPersistenceMutations, ...request.mutations]);
+  pendingPersistenceImmediate = pendingPersistenceImmediate || request.immediate;
   clearTimeout(saveTimer);
-  const delay = request.immediate ? 0 : 220;
+  const delay = pendingPersistenceImmediate ? 0 : (pendingPersistenceMutations.length > 18 ? 520 : 220);
   saveTimer = setTimeout(async () => {
     const requestId = ++latestPersistenceRequest;
+    const mutations = pendingPersistenceMutations;
+    pendingPersistenceMutations = [];
+    pendingPersistenceImmediate = false;
     const snapshot = snapshotForPersistence();
+    const mutationIds = mutations.map((mutation) => mutation.id);
     if (!shellBridge?.saveWorkspaceMutations) {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
       lastAckRevision = Number(snapshot.persistenceRevision || 0);
-      const mutationIds = request.mutations.map((mutation) => mutation.id);
       settleMutations(mutationIds);
       removeRetryEntries(mutationIds);
       clearFailedMutationMarks(mutationIds);
@@ -465,11 +508,11 @@ function persist(input = {}) {
       return;
     }
     try {
-      const ack = await shellBridge.saveWorkspaceMutations({ schemaVersion: 1, clientId: "renderer", baseRevision: lastAckRevision, mutations: request.mutations, snapshot });
+      const ack = await shellBridge.saveWorkspaceMutations({ schemaVersion: 1, clientId: "renderer", baseRevision: lastAckRevision, mutations, snapshot });
       if (!ack?.ok) throw new Error(ack?.details || ack?.error || "Save failed");
       lastAckRevision = Number(ack.revision || lastAckRevision);
       state.persistenceRevision = lastAckRevision;
-      const ackedIds = ack.mutationIds || request.mutations.map((mutation) => mutation.id);
+      const ackedIds = ack.mutationIds || mutationIds;
       settleMutations(ackedIds);
       removeRetryEntries(ackedIds);
       clearFailedMutationMarks(ackedIds);
@@ -480,14 +523,13 @@ function persist(input = {}) {
       refreshOpenSearch();
       renderCanvas();
     } catch (error) {
-      const ids = request.mutations.map((mutation) => mutation.id);
       const message = error?.message || "Persistence ACK failed";
-      settleMutations(ids, message);
-      queueFailedMutations(request.mutations, message);
+      settleMutations(mutationIds, message);
+      queueFailedMutations(mutations, message);
       persistRetryQueueMetadata();
       if (requestId === latestPersistenceRequest) {
         saveState.textContent = "Needs retry";
-        saveState.title = message + (retryQueueCount() ? ` - ${retryQueueCount()} queued` : "");
+        saveState.title = message + (retryQueueCount() ? " - " + retryQueueCount() + " queued" : "");
       }
       renderCanvas();
     }
@@ -502,7 +544,7 @@ function shortMonthDay(date) { return new Intl.DateTimeFormat("en", { month: "sh
 function weekStartForDate(date) { const started = startOfDay(date); const offset = (started.getDay() + 6) % 7; return new Date(started.getTime() - offset * ONE_DAY); }
 function weekDaysForDate(date) { const start = weekStartForDate(date); return Array.from({ length: 7 }, (_, index) => new Date(start.getTime() + index * ONE_DAY)); }
 function formatWeekDate(date) { const days = weekDaysForDate(date); const start = days[0]; const end = days[6]; return `Week of ${shortMonthDay(start)} -${shortMonthDay(end)} , ${end.getFullYear()}`; }
-function isOverviewMode() { return state.viewMode === "weekly" || state.viewMode === "monthly"; }
+function isOverviewMode() { return state.viewMode === "weekly" || state.viewMode === "monthly" || state.viewMode === "large"; }
 function screenToWorld(clientX, clientY) { const cam = camera(); return { x: (clientX - cam.x) / cam.zoom, y: (clientY - cam.y) / cam.zoom }; }
 function dateFromDayId(dayId) {
   const fallback = startOfDay(new Date());
@@ -589,6 +631,181 @@ function refreshOpenSearch() {
   const input = popover.querySelector(".search-input");
   runSearch(input?.value || searchState.query);
   renderSearchResults(popover);
+}
+
+function currentViewportWorldBounds() {
+  const cam = camera();
+  const zoom = Number(cam.zoom || 1);
+  return { left: -cam.x / zoom, top: -cam.y / zoom, right: (window.innerWidth - cam.x) / zoom, bottom: (window.innerHeight - cam.y) / zoom };
+}
+
+function objectApproxBounds(item) {
+  const width = Number(item.width || 240);
+  const height = item.kind === "link" ? 150 : width * Number(item.aspect || 0.75) + ((item.note || state.expandedNoteId === item.id) ? 126 : 48);
+  return { left: Number(item.x || 0), top: Number(item.y || 0) - 60, right: Number(item.x || 0) + width, bottom: Number(item.y || 0) + height };
+}
+
+function shouldRenderHeavyObject(item, viewportBounds = currentViewportWorldBounds()) {
+  if (boardShell.classList.contains("full-day-exporting")) return true;
+  if (items().length < VIRTUAL_RENDER_THRESHOLD) return true;
+  if ([state.selectedId, state.activeKeywordId, state.expandedNoteId].includes(item.id)) return true;
+  if (aiBatchKeywordRunning && aiBatchKeywordStats.currentId === item.id) return true;
+  if (item.pendingMutationIds?.length || item.mutationError || item.aiKeywordState === "pending" || item.aiKeywordState === "failed") return true;
+  if (normalizeSearchText(searchState.query) && searchState.results.some((entry) => entry.dayId === state.activeDayId && entry.id === item.id)) return true;
+  const box = objectApproxBounds(item);
+  const padding = VIRTUAL_RENDER_PADDING / Math.max(Number(camera().zoom || 1), 0.35);
+  return !(box.right < viewportBounds.left - padding || box.left > viewportBounds.right + padding || box.bottom < viewportBounds.top - padding || box.top > viewportBounds.bottom + padding);
+}
+
+function virtualRenderKey() {
+  if (isOverviewMode()) return "overview";
+  const cam = camera();
+  return [Math.round(cam.x / 180), Math.round(cam.y / 180), Math.round(Number(cam.zoom || 1) * 24), items().length, state.selectedId || "", state.activeKeywordId || "", state.expandedNoteId || ""].join("|");
+}
+
+function scheduleVirtualRenderRefresh(delay = 120) {
+  if (isOverviewMode() || items().length < VIRTUAL_RENDER_THRESHOLD) return;
+  window.clearTimeout(virtualRenderTimer);
+  virtualRenderTimer = window.setTimeout(() => {
+    const key = virtualRenderKey();
+    if (key === lastVirtualRenderKey) return;
+    renderCanvas();
+  }, delay);
+}
+
+function createVirtualObject(item) {
+  const object = document.createElement("article");
+  object.className = "image-object virtual-object" + (item.kind === "link" ? " link-object" : "");
+  object.dataset.id = item.id;
+  object.style.left = item.x + "px";
+  object.style.top = item.y + "px";
+  object.style.zIndex = String(item.z);
+  object.style.setProperty("--object-width", (item.width || 240) + "px");
+  const frame = document.createElement("div");
+  frame.className = item.kind === "link" ? "image-frame link-card virtual-frame" : "image-frame virtual-frame";
+  const label = document.createElement("span");
+  label.className = "virtual-label";
+  label.textContent = item.kind === "link" ? "Link" : "Image";
+  frame.appendChild(label);
+  object.appendChild(frame);
+  return object;
+}
+
+function imageRenderSource(item) {
+  const zoom = Number(camera().zoom || 1);
+  if (zoom <= ZOOMED_OUT_THRESHOLD && item.thumbnailSrc) return item.thumbnailSrc;
+  return item.src || item.thumbnailSrc || item.originalSrc || "";
+}
+
+function elementNearViewport(element, padding = 420) {
+  const rect = element.getBoundingClientRect();
+  return rect.right >= -padding && rect.left <= window.innerWidth + padding && rect.bottom >= -padding && rect.top <= window.innerHeight + padding;
+}
+
+function compactDecodeQueue() {
+  for (let index = imageDecodeQueue.length - 1; index >= 0; index -= 1) {
+    const task = imageDecodeQueue[index];
+    if (!task.img.isConnected || (task.priority < 1 && imageDecodeQueue.length > IMAGE_DECODE_QUEUE_MAX)) imageDecodeQueue.splice(index, 1);
+  }
+}
+
+function queueImageDecode(img, src, priority = 0) {
+  if (!src) return;
+  img.loading = "lazy";
+  img.decoding = "async";
+  if (img.dataset.queuedSrc === src) return;
+  if (priority < 1 && imageDecodeQueue.length >= IMAGE_DECODE_QUEUE_MAX && !elementNearViewport(img, 700)) {
+    img.dataset.deferredSrc = src;
+    return;
+  }
+  img.dataset.queuedSrc = src;
+  delete img.dataset.deferredSrc;
+  imageDecodeQueue.push({ img, src, priority, order: Date.now() });
+  imageDecodeQueue.sort((a, b) => b.priority - a.priority || a.order - b.order);
+  compactDecodeQueue();
+  window.requestAnimationFrame(drainImageDecodeQueue);
+}
+
+function queueVisibleDeferredImages() {
+  canvas.querySelectorAll("img[data-deferred-src]").forEach((img) => {
+    if (!elementNearViewport(img, 640)) return;
+    queueImageDecode(img, img.dataset.deferredSrc, 1);
+  });
+}
+
+function scheduleMemoryBudgetSweep(delay = MEMORY_BUDGET_SWEEP_MS) {
+  window.clearTimeout(memoryBudgetTimer);
+  memoryBudgetTimer = window.setTimeout(applyImageMemoryBudget, delay);
+}
+
+function imageMemoryPriority(img) {
+  const object = img.closest("[data-id]");
+  if (object?.dataset.id && [state.selectedId, state.activeKeywordId, state.expandedNoteId].includes(object.dataset.id)) return -100000;
+  if (elementNearViewport(img, 180)) return -50000;
+  const rect = img.getBoundingClientRect();
+  const dx = rect.left + rect.width / 2 - window.innerWidth / 2;
+  const dy = rect.top + rect.height / 2 - window.innerHeight / 2;
+  return Math.abs(dx) + Math.abs(dy);
+}
+
+function applyImageMemoryBudget() {
+  compactDecodeQueue();
+  queueVisibleDeferredImages();
+  const liveImages = Array.from(canvas.querySelectorAll("img[src]")).filter((img) => img.isConnected);
+  boardShell.dataset.liveImageCount = String(liveImages.length);
+  boardShell.dataset.decodeQueueCount = String(imageDecodeQueue.length + imageDecodeActive);
+}
+
+function drainImageDecodeQueue() {
+  while (imageDecodeActive < IMAGE_DECODE_CONCURRENCY && imageDecodeQueue.length) {
+    const task = imageDecodeQueue.shift();
+    if (!task.img.isConnected) continue;
+    imageDecodeActive += 1;
+    const done = () => {
+      window.clearTimeout(timeout);
+      imageDecodeActive = Math.max(0, imageDecodeActive - 1);
+      drainImageDecodeQueue();
+    };
+    const timeout = window.setTimeout(done, 12000);
+    task.img.addEventListener("load", done, { once: true });
+    task.img.addEventListener("error", done, { once: true });
+    task.img.src = task.src;
+  }
+}
+
+function captureQueueStatusText(active = captureQueueActive, queued = captureQueue.length) {
+  if (active || queued) return "Importing " + active + " active / " + queued + " queued";
+  return "Import complete";
+}
+
+function enqueueCaptureTask(label, run) {
+  return new Promise((resolve) => {
+    captureQueue.push({ label, run, resolve });
+    saveState.textContent = captureQueueStatusText();
+    saveState.title = "Image imports are queued to keep the board responsive.";
+    drainCaptureQueue();
+  });
+}
+
+function drainCaptureQueue() {
+  while (captureQueueActive < CAPTURE_QUEUE_CONCURRENCY && captureQueue.length) {
+    const task = captureQueue.shift();
+    captureQueueActive += 1;
+    saveState.textContent = captureQueueStatusText();
+    Promise.resolve().then(task.run).catch((error) => {
+      saveState.textContent = "Capture failed";
+      saveState.title = error?.message || "Capture failed";
+    }).finally(() => {
+      captureQueueActive = Math.max(0, captureQueueActive - 1);
+      task.resolve();
+      saveState.textContent = captureQueueStatusText();
+      if (!captureQueueActive && !captureQueue.length) {
+        saveState.title = "";
+        window.setTimeout(() => { if (!captureQueueActive && !captureQueue.length) saveState.textContent = retryQueueCount() ? "Needs retry" : "Saved"; }, 900);
+      }
+      window.setTimeout(drainCaptureQueue, CAPTURE_QUEUE_BATCH_GAP_MS);
+    });
+  }
 }
 
 
@@ -1173,22 +1390,34 @@ function isAiKeywordImageReady(item) {
   return Boolean(item.assetId && String(item.lifecycleState || "").toUpperCase() === "DURABLE");
 }
 
-function markAiKeywordWaitingForDurable(item, retryWhenDurable = false) {
-  item.aiKeywordState = retryWhenDurable ? "pending" : "failed";
+function markAiKeywordWaitingForDurable(item, retryWhenDurable = true, autoQueued = false) {
+  item.aiKeywordState = "pending";
   item.aiKeywordError = "AI_IMAGE_NOT_DURABLE";
   item.aiKeywordRetryWhenDurable = Boolean(retryWhenDurable);
+  item.aiKeywordAutoQueued = Boolean(autoQueued);
   item.aiKeywordInFlight = false;
-  saveState.textContent = retryWhenDurable ? "Waiting for image save" : "Image not saved yet";
+  saveState.textContent = "Waiting for image save";
   renderCanvas();
 }
 
 function clearAiDurableWait(item) {
   if (item.aiKeywordError !== "AI_IMAGE_NOT_DURABLE" && !item.aiKeywordRetryWhenDurable) return;
   const shouldRetry = Boolean(item.aiKeywordRetryWhenDurable);
+  const autoQueued = Boolean(item.aiKeywordAutoQueued);
   item.aiKeywordRetryWhenDurable = false;
+  item.aiKeywordAutoQueued = false;
   item.aiKeywordError = "";
   item.aiKeywordState = shouldRetry ? "pending" : "idle";
-  if (shouldRetry) window.setTimeout(() => { if (isAiKeywordImageReady(item)) generateKeywordCandidatesForItem(item, false); }, 80);
+  if (!shouldRetry) return;
+  window.setTimeout(() => {
+    if (!isAiKeywordImageReady(item)) return;
+    if (autoQueued) {
+      if (aiAutoKeywordEnabled) queueAutoKeywordItem(item, "durable-ready");
+      else item.aiKeywordState = visibleKeywordCandidates(item).length ? "suggested" : "idle";
+      return;
+    }
+    generateKeywordCandidatesForItem(item, false);
+  }, 80);
 }
 
 function aiJobs() { state.aiJobs = cloneAiJobs(state.aiJobs); return state.aiJobs; }
@@ -1286,47 +1515,110 @@ function aiJobCounts() {
 function hasAcceptedOrPinnedKeywords(item) {
   return Boolean((item.keywords || []).length || cloneKeywordCandidates(item.keywordCandidates).some((candidate) => candidate.state === "accepted"));
 }
-function canGenerateKeywordsInBatch(item) {
+function hasUnreviewedKeywordCandidates(item) {
+  return cloneKeywordCandidates(item?.keywordCandidates).some((candidate) => candidate.state === "suggested");
+}
+function hasCanceledAiKeywordJob(item) {
+  return latestAiJobForItem(item)?.state === "canceled";
+}
+function canConsiderAiKeywordItem(item) {
   if (!externalAiReady()) return false;
-  if (!item || item.kind === "link" || item.aiKeywordState === "pending" || activeAiJobForItem(item)) return false;
+  if (!item || item.kind === "link") return false;
+  if (item.aiKeywordState === "failed" && item.aiKeywordError !== "AI_IMAGE_NOT_DURABLE") return false;
+  if (activeAiJobForItem(item) || hasCanceledAiKeywordJob(item)) return false;
+  return !hasAcceptedOrPinnedKeywords(item) && !hasUnreviewedKeywordCandidates(item);
+}
+function canGenerateKeywordsInBatch(item) {
+  if (!canConsiderAiKeywordItem(item)) return false;
   if (!isAiKeywordImageReady(item)) return false;
-  return !hasAcceptedOrPinnedKeywords(item);
+  return true;
 }
 function canAutoGenerateKeywords(item) {
   if (!aiAutoKeywordEnabled) return false;
-  if (item?.aiKeywordState === "failed") return false;
-  return canGenerateKeywordsInBatch(item);
+  return canConsiderAiKeywordItem(item);
 }
 function aiBatchEligibleItems() {
   return items().filter(canGenerateKeywordsInBatch);
 }
 function sleep(ms) { return new Promise((resolve) => window.setTimeout(resolve, ms)); }
 
-function disableAiAutoKeywords(reason = "window-left") {
-  if (!aiAutoKeywordEnabled) return;
-  aiAutoKeywordEnabled = false;
-  saveState.textContent = reason === "mock" ? "AI auto off" : "AI auto paused";
+function aiAutoStatusText() {
+  if (!aiAutoKeywordEnabled) return "Off";
+  if (aiBatchKeywordRunning) return "Paused during day batch";
+  const waiting = items().filter((item) => item.aiKeywordAutoQueued && !isAiKeywordImageReady(item)).length;
+  const queued = aiAutoKeywordQueue.length;
+  if (aiAutoKeywordRunning) return queued ? "Running · " + queued + " queued" : "Running";
+  if (waiting) return "Waiting for " + waiting + " image" + (waiting > 1 ? "s" : "");
+  return queued ? "On · " + queued + " queued" : "On this window";
 }
 
-function maybeAutoGenerateKeywords(item) {
-  if (!canAutoGenerateKeywords(item)) return;
-  window.setTimeout(() => {
-    if (canAutoGenerateKeywords(item)) generateKeywordCandidatesForItem(item, false);
-  }, 120);
+function queueAutoKeywordItem(item, reason = "auto") {
+  if (!aiAutoKeywordEnabled || !canAutoGenerateKeywords(item)) return false;
+  if (!isAiKeywordImageReady(item)) {
+    markAiKeywordWaitingForDurable(item, true, true);
+    return true;
+  }
+  if (aiAutoKeywordQueuedIds.has(item.id)) return false;
+  aiAutoKeywordQueuedIds.add(item.id);
+  aiAutoKeywordQueue.push(item.id);
+  item.aiKeywordAutoQueued = true;
+  if (item.aiKeywordState !== "pending") item.aiKeywordState = "pending";
+  item.aiKeywordError = "";
+  item.aiKeywordInFlight = false;
+  if (reason === "drop") saveState.textContent = "AI queued";
+  drainAutoKeywordQueue();
+  return true;
 }
 
-async function runAutoKeywordsForCurrentDay() {
-  if (aiAutoKeywordRunning || !aiAutoKeywordEnabled) return;
+async function drainAutoKeywordQueue() {
+  if (aiAutoKeywordRunning || !aiAutoKeywordEnabled || aiBatchKeywordRunning) return;
   aiAutoKeywordRunning = true;
   try {
-    const candidates = items().filter(canAutoGenerateKeywords).slice(0, AI_AUTO_KEYWORD_BATCH_LIMIT);
-    for (const item of candidates) {
-      if (!aiAutoKeywordEnabled) break;
+    while (aiAutoKeywordEnabled && !aiBatchKeywordRunning && aiAutoKeywordQueue.length) {
+      const itemId = aiAutoKeywordQueue.shift();
+      aiAutoKeywordQueuedIds.delete(itemId);
+      const item = items().find((entry) => entry.id === itemId);
+      if (!item || !canAutoGenerateKeywords(item)) continue;
+      if (!isAiKeywordImageReady(item)) {
+        markAiKeywordWaitingForDurable(item, true, true);
+        continue;
+      }
+      item.aiKeywordAutoQueued = false;
       await generateKeywordCandidatesForItem(item, false);
+      if (aiAutoKeywordEnabled && aiAutoKeywordQueue.length) await sleep(AI_AUTO_KEYWORD_DELAY_MS);
     }
   } finally {
     aiAutoKeywordRunning = false;
   }
+}
+
+function disableAiAutoKeywords(reason = "window-left") {
+  if (!aiAutoKeywordEnabled) return;
+  aiAutoKeywordEnabled = false;
+  aiAutoKeywordQueue.splice(0, aiAutoKeywordQueue.length);
+  aiAutoKeywordQueuedIds.clear();
+  items().forEach((item) => {
+    if (!item.aiKeywordAutoQueued) return;
+    item.aiKeywordAutoQueued = false;
+    if (item.aiKeywordError === "AI_IMAGE_NOT_DURABLE") {
+      item.aiKeywordRetryWhenDurable = false;
+      item.aiKeywordError = "";
+      item.aiKeywordState = visibleKeywordCandidates(item).length ? "suggested" : "idle";
+    }
+  });
+  saveState.textContent = reason === "mock" ? "AI auto off" : "AI auto paused";
+  renderCanvas();
+}
+
+function maybeAutoGenerateKeywords(item) {
+  if (!aiAutoKeywordEnabled) return;
+  window.setTimeout(() => queueAutoKeywordItem(item, "drop"), 120);
+}
+
+async function runAutoKeywordsForCurrentDay() {
+  if (!aiAutoKeywordEnabled) return;
+  await refreshKeywordProviderState();
+  items().filter(canAutoGenerateKeywords).slice(0, AI_AUTO_KEYWORD_BATCH_LIMIT).forEach((item) => queueAutoKeywordItem(item, "scan"));
 }
 async function runBatchKeywordsForCurrentDay(popover = null) {
   await refreshKeywordProviderState();
@@ -1335,7 +1627,9 @@ async function runBatchKeywordsForCurrentDay(popover = null) {
     if (popover) refreshAiPopover(popover);
     return;
   }
-  const queue = aiBatchEligibleItems();
+  const allEligible = aiBatchEligibleItems();
+  const queue = allEligible.slice(0, AI_BATCH_KEYWORD_MAX_PER_RUN);
+  const deferredCount = Math.max(0, allEligible.length - queue.length);
   if (!queue.length) {
     saveState.textContent = "No images need AI";
     resetAiBatchStats(0);
@@ -1345,11 +1639,12 @@ async function runBatchKeywordsForCurrentDay(popover = null) {
   aiBatchKeywordRunning = true;
   aiBatchStopRequested = false;
   resetAiBatchStats(queue.length);
-  saveState.textContent = "AI batch 0 / " + queue.length;
+  aiBatchKeywordStats.skipped = deferredCount;
+  saveState.textContent = deferredCount ? "AI batch 0 / " + queue.length + " · " + deferredCount + " later" : "AI batch 0 / " + queue.length;
   if (popover) refreshAiPopover(popover);
   try {
     for (let index = 0; index < queue.length; index += 1) {
-      if (aiBatchStopRequested) break;
+      if (aiBatchStopRequested) { aiBatchKeywordStats.skipped += queue.length - index; break; }
       const item = queue[index];
       if (!canGenerateKeywordsInBatch(item)) { aiBatchKeywordStats.skipped += 1; continue; }
       aiBatchKeywordStats.currentId = item.id;
@@ -1373,9 +1668,11 @@ async function runBatchKeywordsForCurrentDay(popover = null) {
     aiBatchStopRequested = false;
     if (popover) refreshAiPopover(popover);
     renderCanvas();
+    if (aiAutoKeywordEnabled) drainAutoKeywordQueue();
   }
 }
 function stopBatchKeywords(popover = null) {
+  if (!aiBatchKeywordRunning) return;
   aiBatchStopRequested = true;
   saveState.textContent = "Stopping AI batch";
   if (popover) refreshAiPopover(popover);
@@ -1439,13 +1736,46 @@ function providerStatusRows(options) {
     ["Image sent", permissions.imageAccess ? "Working copy only" : "No"],
     ["Text sent", permissions.textAccess ? "Keywords only" : "No"],
     ["Network", permissions.network ? "Allowed" : "Off"],
-    ["Auto keywords", aiAutoKeywordEnabled ? "On for this window" : "Off"],
+    ["Auto keywords", aiAutoStatusText()],
     ["Session rule", "Turns off when window leaves"],
     ["AI jobs", String(counts.queued || 0) + " queued / " + String(counts.sending || 0) + " sending / " + String(counts.failed || 0) + " failed"],
     ["Batch", aiBatchStatusText()]
   ]);
 }
 
+
+function qwenKeyDisplay(options = qwenProviderOptions()) {
+  if (!options.apiKeyAvailable) return "Missing";
+  return options.apiKeySource === "secure storage" ? "Saved" : "Available";
+}
+
+function qwenReadinessText(options = qwenProviderOptions()) {
+  if (!profileState.keywordProvider?.externalProviderEnabled) return "Off";
+  if (!options.apiKeyAvailable) return "Needs key";
+  if (!profileState.keywordProvider?.permissions?.network) return "Network off";
+  return "Ready";
+}
+
+function aiActionDisabledReason(action, options = qwenProviderOptions()) {
+  if (action === "provider" && !shellBridge?.setKeywordProviderConfig) return "Desktop only";
+  if (action === "test") {
+    if (!shellBridge?.testKeywordProvider) return "Desktop only";
+    if (!profileState.keywordProvider?.externalProviderEnabled) return "Enable Qwen first";
+    if (!options.apiKeyAvailable) return "No API key";
+  }
+  if (action === "auto") {
+    if (!profileState.keywordProvider?.externalProviderEnabled) return "Enable Qwen first";
+    if (!options.apiKeyAvailable) return "No API key";
+    if (!externalAiReady()) return "Qwen is not ready";
+  }
+  if (action === "batch") {
+    if (!profileState.keywordProvider?.externalProviderEnabled) return "Enable Qwen first";
+    if (!options.apiKeyAvailable) return "No API key";
+    if (!externalAiReady()) return "Qwen is not ready";
+    if (!aiBatchKeywordRunning && !aiBatchEligibleItems().length) return "No Durable images need AI";
+  }
+  return "";
+}
 
 function aiProviderSetupHint() {
   const options = qwenProviderOptions();
@@ -1467,6 +1797,7 @@ function createMoreAiControls(popover) {
   const options = qwenProviderOptions();
   const counts = aiJobCounts();
   const qwenEnabled = profileState.keywordProvider?.activeProvider === "qwen3.7-flash" && profileState.keywordProvider?.externalProviderEnabled;
+  const batchEligibleCount = aiBatchEligibleItems().length;
   const panel = document.createElement("div");
   panel.className = "ai-provider-settings ai-more-controls" + (qwenEnabled ? " qwen-enabled" : "");
   const head = document.createElement("div");
@@ -1474,47 +1805,48 @@ function createMoreAiControls(popover) {
   const title = document.createElement("strong");
   title.textContent = "AI Keywords";
   const stateLabel = document.createElement("span");
-  stateLabel.textContent = providerEnabledSummary(provider);
+  stateLabel.textContent = qwenReadinessText(options);
   head.append(title, stateLabel);
 
   const rows = createDetailRows([
-    ["Provider", profileState.keywordProvider?.activeProvider === "qwen3.7-flash" && profileState.keywordProvider?.externalProviderEnabled ? "Qwen" : "Off / local"],
-    ["Model", options.model],
-    ["Key", options.apiKeyAvailable ? "Available" : "Not set"],
-    ["Auto", aiAutoKeywordEnabled ? "On this window" : "Off"],
-    ["Queue", aiBatchStatusText()],
-    ["Failed", String(counts.failed || 0)]
+    ["Status", qwenEnabled ? "Qwen" : "Off"],
+    ["Key", qwenKeyDisplay(options)],
+    ["Auto", aiAutoStatusText()],
+    ["Day queue", aiBatchStatusText()],
+    ["Needs retry", String(counts.failed || 0)]
   ]);
 
   const actions = document.createElement("div");
   actions.className = "ai-provider-actions";
   const enableQwen = document.createElement("button");
   enableQwen.type = "button";
-  enableQwen.textContent = qwenEnabled ? "Turn AI off" : "Enable Qwen";
-  enableQwen.title = qwenEnabled ? "Stop new external AI jobs and keep approved keywords" : "Turn on Qwen for new keyword suggestions";
-  enableQwen.disabled = !shellBridge?.setKeywordProviderConfig;
+  enableQwen.textContent = qwenEnabled ? "Disable Qwen" : "Enable Qwen";
+  enableQwen.title = aiActionDisabledReason("provider", options) || (qwenEnabled ? "Stop new external AI jobs and keep approved keywords" : "Turn on Qwen for keyword suggestions");
+  enableQwen.disabled = Boolean(aiActionDisabledReason("provider", options));
   enableQwen.addEventListener("click", () => setAiProviderFromMenu(popover, qwenEnabled ? "local-mock" : "qwen3.7-flash"));
-  const test = document.createElement("button");
-  test.type = "button";
-  test.textContent = "Test connection";
-  test.disabled = !shellBridge?.testKeywordProvider || !profileState.keywordProvider?.externalProviderEnabled || profileState.keywordProvider?.activeProvider === "local-mock";
-  test.addEventListener("click", () => testAiProviderFromMenu(popover));
   const auto = document.createElement("button");
   auto.type = "button";
   auto.textContent = aiAutoKeywordEnabled ? "Auto off" : "Auto keywords";
-  auto.disabled = !externalAiReady();
+  auto.title = aiActionDisabledReason("auto", options) || "Automatically queue new Durable images while this window stays active";
+  auto.disabled = Boolean(aiActionDisabledReason("auto", options));
   auto.addEventListener("click", () => toggleAiAutoKeywords(popover));
   const batch = document.createElement("button");
   batch.type = "button";
   batch.textContent = aiBatchKeywordRunning ? "Stop day AI" : "Generate day";
-  batch.title = aiBatchKeywordRunning ? "Stop unfinished current-day AI suggestions" : "Generate candidate keywords for eligible Durable images on this day";
-  batch.disabled = !externalAiReady() || (!aiBatchKeywordRunning && !aiBatchEligibleItems().length);
+  batch.title = aiBatchKeywordRunning ? "Stop unfinished current-day AI suggestions" : aiActionDisabledReason("batch", options) || "Generate suggestions for eligible Durable images on this day";
+  batch.disabled = Boolean(aiActionDisabledReason("batch", options));
   batch.addEventListener("click", () => aiBatchKeywordRunning ? stopBatchKeywords(popover) : runBatchKeywordsForCurrentDay(popover));
-  actions.append(enableQwen, test, auto, batch);
+  const test = document.createElement("button");
+  test.type = "button";
+  test.textContent = "Test connection";
+  test.title = aiActionDisabledReason("test", options) || "Checks Qwen setup without uploading a board image";
+  test.disabled = Boolean(aiActionDisabledReason("test", options));
+  test.addEventListener("click", () => testAiProviderFromMenu(popover));
+  actions.append(enableQwen, auto, batch, test);
 
   const hint = document.createElement("p");
   hint.className = "ai-provider-hint";
-  hint.textContent = profileState.keywordProvider?.externalProviderEnabled ? "Qwen can use working image copies for new suggestions. Details live in Data & Privacy." : "AI is off by default. Enable Qwen only when you want external suggestions.";
+  hint.textContent = profileState.keywordProvider?.externalProviderEnabled ? "Suggestions stay unapproved until you Accept or Pin them." : "AI is off. Enable Qwen only when you want external suggestions.";
   panel.append(head, rows, actions, hint);
   return panel;
 }
@@ -1562,6 +1894,40 @@ async function setAiProviderFromMenu(popover, providerId) {
     saveState.textContent = "Provider update failed";
     saveState.title = error?.message || "Provider update failed";
   }
+}
+
+async function importQwenKeyFromMenu(popover) {
+  if (!shellBridge?.importQwenApiKeyFile) return;
+  saveState.textContent = "Choosing key file";
+  try {
+    const result = await shellBridge.importQwenApiKeyFile();
+    if (result?.canceled) { saveState.textContent = "Key unchanged"; refreshAiPopover(popover); return; }
+    if (!result?.ok) throw new Error(result?.error || "Key save failed");
+    if (result.keywordProvider) profileState.keywordProvider = result.keywordProvider;
+    saveState.textContent = "Qwen key saved";
+  } catch (error) {
+    const code = error?.message || "Key save failed";
+    saveState.textContent = readableAiKeywordError(code);
+    saveState.title = [aiKeywordErrorDetail(code), code ? "Error code: " + code : ""].filter(Boolean).join("\n");
+  }
+  await refreshKeywordProviderState();
+  refreshAiPopover(popover);
+}
+
+async function clearQwenKeyFromMenu(popover) {
+  if (!shellBridge?.clearQwenApiKey) return;
+  saveState.textContent = "Clearing Qwen key";
+  try {
+    const result = await shellBridge.clearQwenApiKey();
+    if (!result?.ok) throw new Error(result?.error || "Key clear failed");
+    if (result.keywordProvider) profileState.keywordProvider = result.keywordProvider;
+    saveState.textContent = "Qwen key cleared";
+  } catch (error) {
+    saveState.textContent = "Key clear failed";
+    saveState.title = error?.message || "Key clear failed";
+  }
+  await refreshKeywordProviderState();
+  refreshAiPopover(popover);
 }
 
 async function testAiProviderFromMenu(popover) {
@@ -1630,16 +1996,21 @@ function openDataPrivacyPopover(popover) {
   const providerPermissions = profileState.keywordProvider?.permissions || {};
   const aiOptions = qwenProviderOptions();
   const providerRows = createDetailRows([
-    ["Provider", profileState.keywordProvider?.activeProvider || "local-mock"],
+    ["Provider", profileState.keywordProvider?.externalProviderEnabled ? "Qwen" : "Off / local mock"],
     ["Model", aiOptions.model],
     ["Prompt", aiOptions.promptVersion],
-    ["Qwen key", aiOptions.apiKeyAvailable ? "Available" : "Not set"],
+    ["Qwen key", qwenKeyDisplay(aiOptions)],
+    ["Key source", aiOptions.apiKeySource || "not set"],
     ["Image access", providerPermissions.imageAccess ? "Working copy only" : "Off"],
     ["Text access", providerPermissions.textAccess ? "Keywords only" : "Off"],
     ["Network", providerPermissions.network ? "Allowed" : "Off"],
-    ["Auto keywords", aiAutoKeywordEnabled ? "On this window" : "Off"],
     ["Privacy", "Absolute paths omitted"]
   ]);
+  const importKey = makePopoverButton("Save Qwen key", shellBridge?.importQwenApiKeyFile ? "Choose file" : "Desktop only", () => importQwenKeyFromMenu(popover), !shellBridge?.importQwenApiKeyFile);
+  importKey.title = "Choose a small .txt/.key/.env file that contains only the Qwen key or AESTHETICBOARD_QWEN_API_KEY=value.";
+  const clearKeyDisabled = !shellBridge?.clearQwenApiKey || aiOptions.apiKeySource !== "secure storage";
+  const clearKey = makePopoverButton("Clear saved key", aiOptions.apiKeySource === "secure storage" ? "Remove" : (aiOptions.apiKeyAvailable ? "Env key" : "No saved key"), () => clearQwenKeyFromMenu(popover), clearKeyDisabled);
+  clearKey.title = aiOptions.apiKeySource === "secure storage" ? "Remove the encrypted Qwen key from this device profile." : "Only keys saved by the app can be cleared here.";
   const providerList = createProviderCapabilityList();
 
   const rebuildSearch = makePopoverButton("Rebuild search", shellBridge?.rebuildSearchIndex ? "Local index" : "Desktop only", () => rebuildSearchIndexFromMenu(popover), !shellBridge?.rebuildSearchIndex);
@@ -1648,7 +2019,7 @@ function openDataPrivacyPopover(popover) {
   const localSection = createSettingsSection("Local Data", [localRows, verify], "Your board is stored locally in this device profile.");
   const backupSection = createSettingsSection("Backup / Restore", [backup, preview, importNewDay], "Backups omit absolute paths. Restore preview is read-only; import adds a separate day.");
   const mediaSection = createSettingsSection("Media Repair", [repairSummary, scanMedia, applyMedia, repairIndex]);
-  const aiSection = createSettingsSection("AI Privacy", [providerRows, createAiProviderSetupHint(), providerList], "AI controls live in More. This section only explains data access, model, prompt, and privacy boundaries.");
+  const aiSection = createSettingsSection("AI Privacy", [providerRows, importKey, clearKey, createAiProviderSetupHint(), providerList], "More controls AI on/off and generation. This section manages key storage and explains data access.");
   const maintenanceSection = createSettingsSection("Maintenance", [rebuildSearch, fixture], "Developer-safe tools for rebuilding local read models and recovery fixtures.");
   const status = document.createElement("div");
   status.className = "export-status";
@@ -1758,13 +2129,17 @@ function openMorePopover(popover) {
   const always = makePopoverButton("Always-on-top", status, toggleAlwaysOnTop, !shellBridge);
   always.dataset.action = "always-on-top";
   const dragHarness = makePopoverButton("Drag Harness", `${state.dragHarness.length} samples`, () => openDragHarnessPopover(popover));
+  const largeOverview = makePopoverButton("Large day overview", scaleHarnessSummary(), () => setViewMode("large"));
+  const addScale120 = makePopoverButton("Add scale samples", "+120 refs", () => { createScaleHarnessItems(120); openMorePopover(popover); });
+  const addScale300 = makePopoverButton("Stress scale samples", "+300 refs", () => { createScaleHarnessItems(300); openMorePopover(popover); });
+  const clearScale = makePopoverButton("Clear scale samples", scaleHarnessCount() ? `${scaleHarnessCount()} refs` : "None", () => { clearScaleHarnessItems(); openMorePopover(popover); }, !scaleHarnessCount());
   const retrySaves = makePopoverButton("Retry failed saves", retryQueueCount() ? `${retryQueueCount()} queued` : "None", retryAllMutations, !retryQueueCount());
   const search = makePopoverButton("Search board", searchState.query ? `${searchState.results.length} matches` : "Ctrl / Cmd + F", () => openSearchPopover(popover));
   const aiControls = createMoreAiControls(popover);
   const privacy = makePopoverButton("Data & Privacy", shellBridge ? "Storage / privacy" : "Desktop only", null, !shellBridge);
   privacy.dataset.action = "data-privacy";
   privacy.addEventListener("click", (event) => { event.preventDefault(); event.stopPropagation(); openDataPrivacyPopover(popover); });
-  popover.append(title, aiControls, search, retrySaves, always, dragHarness, privacy);
+  popover.append(title, aiControls, search, largeOverview, addScale120, addScale300, clearScale, retrySaves, always, dragHarness, privacy);
 }
 function renderSearchResults(popover) {
   const list = popover.querySelector(".search-results");
@@ -1807,17 +2182,21 @@ function renderChrome() {
   } else if (state.viewMode === "monthly") {
     titleButton.textContent = "Monthly Inspiration Calendar";
     dateLabel.textContent = formatMonthDate(date);
+  } else if (state.viewMode === "large") {
+    titleButton.textContent = currentDay.title || "Large Day Overview";
+    dateLabel.textContent = formatSecondaryDate(date);
   } else {
     titleButton.textContent = currentDay.title || formatMainDate(date);
     dateLabel.textContent = formatSecondaryDate(date);
   }
   modeSelector.querySelectorAll("[data-mode]").forEach((button) => {
-    const active = button.dataset.mode === state.viewMode;
+    const active = button.dataset.mode === (state.viewMode === "large" ? "day" : state.viewMode);
     button.classList.toggle("active", active);
     button.setAttribute("aria-pressed", String(active));
   });
   boardShell.classList.toggle("weekly-mode", state.viewMode === "weekly");
   boardShell.classList.toggle("monthly-mode", state.viewMode === "monthly");
+  boardShell.classList.toggle("large-overview-mode", state.viewMode === "large");
   const surface = surfaces[state.surface] || surfaces.quiet;
   boardShell.style.backgroundImage = surface.image ? `linear-gradient(rgb(244 241 233 / 58%), rgb(244 241 233 / 58%)), url("${surface.image}")` : "linear-gradient(rgb(244 241 233), rgb(244 241 233))";
 }
@@ -1828,6 +2207,191 @@ function updateBoardDensityState() {
   boardShell.classList.toggle("dense-board", currentItems.length >= DENSE_ITEM_THRESHOLD);
   boardShell.classList.toggle("zoomed-out", cam.zoom <= ZOOMED_OUT_THRESHOLD);
   boardShell.dataset.itemCount = String(currentItems.length);
+  if (state.viewMode === "large") {
+    boardShell.dataset.renderedCount = String(currentItems.length);
+    boardShell.dataset.virtualCount = "overview";
+  }
+}
+
+
+function scaleHarnessSources() {
+  return [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15].map((index) => `refer/测试照片/测试照片${index}.jpg`);
+}
+
+function scaleHarnessCount() {
+  return items().filter((item) => item.sourceType === "scale-test-fixture").length;
+}
+
+function scaleHarnessSummary() {
+  const count = items().length;
+  const testCount = scaleHarnessCount();
+  const rendered = boardShell.dataset.renderedCount || "0";
+  const virtual = boardShell.dataset.virtualCount || "0";
+  return testCount ? `${testCount} test / ${count} refs` : `${count} refs`;
+}
+
+function createScaleHarnessItems(count) {
+  const currentDay = day();
+  const sources = scaleHarnessSources();
+  const startIndex = scaleHarnessCount();
+  const columns = Math.ceil(Math.sqrt(count));
+  const spacingX = 270;
+  const spacingY = 330;
+  const baseX = -Math.round(columns * spacingX / 2);
+  const baseY = -Math.round(Math.ceil(count / columns) * spacingY / 2);
+  const now = new Date().toISOString();
+  const topZ = Math.max(...items().map((value) => Number(value.z || 0)), 0);
+  const created = [];
+  for (let index = 0; index < count; index += 1) {
+    const sequence = startIndex + index + 1;
+    const source = sources[index % sources.length];
+    const column = index % columns;
+    const row = Math.floor(index / columns);
+    const width = 170 + (sequence % 5) * 18;
+    const item = {
+      id: `scale-fixture-${Date.now()}-${sequence}`,
+      kind: "image",
+      src: source,
+      originalSrc: source,
+      thumbnailSrc: source,
+      sourceType: "scale-test-fixture",
+      capturedAt: now,
+      capturedAtUtc: now,
+      createdAtUtc: now,
+      x: baseX + column * spacingX + (row % 2) * 28,
+      y: baseY + row * spacingY + (column % 3) * 14,
+      width,
+      aspect: 0.72 + (sequence % 4) * 0.06,
+      z: topZ + index + 1,
+      locked: false,
+      keywords: [`scale sample ${String(sequence).padStart(3, "0")}`],
+      note: sequence % 6 === 0 ? "Scale test note. Safe to clear from More." : "",
+      lifecycleState: "ORIGINAL_LOCAL",
+      captureError: "",
+      captureJobId: `scale-fixture-job-${Date.now()}-${sequence}`,
+      pendingDataUrl: "",
+      sourceUrl: "",
+      keywordCandidates: [],
+      aiKeywordState: "idle",
+      aiKeywordProvider: "local-mock"
+    };
+    currentDay.items.push(item);
+    created.push(item);
+  }
+  currentDay.pasteSequence += count;
+  state.selectedId = created[0]?.id || null;
+  state.activeKeywordId = null;
+  state.expandedNoteId = null;
+  renderCanvas();
+  persist({ immediate: true, reason: `scale-harness-add-${count}` });
+  saveState.textContent = `Added ${count} test refs`;
+  setTimeout(() => { saveState.textContent = retryQueueCount() ? "Needs retry" : "Saved"; }, TRASH_FEEDBACK_MS);
+}
+
+function clearScaleHarnessItems() {
+  const currentDay = day();
+  const before = currentDay.items.length;
+  currentDay.items = currentDay.items.filter((item) => item.sourceType !== "scale-test-fixture");
+  const removed = before - currentDay.items.length;
+  if (!removed) return;
+  state.selectedId = null;
+  state.activeKeywordId = null;
+  state.expandedNoteId = null;
+  renderCanvas();
+  persist({ immediate: true, reason: "scale-harness-clear" });
+  saveState.textContent = `Cleared ${removed} test refs`;
+  setTimeout(() => { saveState.textContent = retryQueueCount() ? "Needs retry" : "Saved"; }, TRASH_FEEDBACK_MS);
+}
+
+function itemOverviewTitle(item) {
+  if (item.kind === "link") return item.label || linkTitleFromUrl(item.url) || "Link";
+  return item.keywords?.[0] || item.note || item.sourceType || "Image";
+}
+
+function itemOverviewMeta(item) {
+  const bits = [item.kind === "link" ? "Link" : "Image"];
+  if (item.lifecycleState === "DURABLE" || item.lifecycleState === "ORIGINAL_LOCAL") bits.push("ready");
+  else if (item.lifecycleState) bits.push(String(item.lifecycleState).toLowerCase().replaceAll("_", " "));
+  if (item.locked) bits.push("locked");
+  if (item.note) bits.push("note");
+  if ((item.keywords || []).length) bits.push((item.keywords || []).length + " keywords");
+  return bits.join(" / ");
+}
+
+function openObjectFromLargeOverview(itemId) {
+  const item = items().find((candidate) => candidate.id === itemId);
+  if (!item) return;
+  state.viewMode = "day";
+  state.selectedId = item.id;
+  state.activeKeywordId = null;
+  state.expandedNoteId = item.note ? item.id : null;
+  renderChrome();
+  renderCanvas();
+  centerCameraOnItem(item);
+  persist({ immediate: true, mutations: [
+    makeMutation("day.select", { activeDayId: state.activeDayId, viewMode: state.viewMode, source: "large-overview" }),
+    makeMutation("camera.update", { camera: { ...camera() }, source: "large-overview" })
+  ] });
+}
+
+function createLargeOverviewTile(item, index) {
+  const tile = document.createElement("button");
+  tile.type = "button";
+  tile.className = "large-overview-tile";
+  tile.dataset.id = item.id;
+  const thumb = document.createElement("div");
+  thumb.className = "large-overview-thumb";
+  const src = item.kind === "link" ? "" : imageRenderSource(item);
+  if (src) {
+    const img = document.createElement("img");
+    img.alt = itemOverviewTitle(item);
+    img.loading = "lazy";
+    img.decoding = "async";
+    if (index < LARGE_OVERVIEW_THUMB_BUDGET) queueImageDecode(img, src, index < ACTIVE_IMAGE_ELEMENT_BUDGET ? 1 : 0);
+    else img.dataset.deferredSrc = src;
+    thumb.appendChild(img);
+  } else {
+    thumb.textContent = item.kind === "link" ? "LINK" : "REF";
+  }
+  const text = document.createElement("div");
+  text.className = "large-overview-text";
+  const title = document.createElement("strong");
+  title.textContent = itemOverviewTitle(item);
+  const meta = document.createElement("span");
+  meta.textContent = `#${String(index + 1).padStart(3, "0")} / ${itemOverviewMeta(item)}`;
+  text.append(title, meta);
+  tile.append(thumb, text);
+  tile.addEventListener("click", () => openObjectFromLargeOverview(item.id));
+  return tile;
+}
+
+function renderLargeDayOverview() {
+  const currentItems = items().slice().sort((a, b) => a.z - b.z);
+  const wrap = document.createElement("section");
+  wrap.className = "large-overview-board";
+  const header = document.createElement("header");
+  header.className = "large-overview-head";
+  const title = document.createElement("h2");
+  title.textContent = "Large Day Overview";
+  const summary = document.createElement("span");
+  const images = currentItems.filter((item) => item.kind !== "link").length;
+  const links = currentItems.length - images;
+  summary.textContent = `${currentItems.length} refs / ${images} images / ${links} links`;
+  header.append(title, summary);
+  const grid = document.createElement("div");
+  grid.className = "large-overview-grid";
+  if (!currentItems.length) {
+    const empty = document.createElement("p");
+    empty.className = "large-overview-empty";
+    empty.textContent = "No references on this day yet.";
+    grid.appendChild(empty);
+  } else {
+    currentItems.forEach((item, index) => grid.appendChild(createLargeOverviewTile(item, index)));
+  }
+  wrap.append(header, grid);
+  canvas.appendChild(wrap);
+  boardShell.dataset.renderedCount = String(currentItems.length);
+  boardShell.dataset.virtualCount = "overview";
 }
 
 function renderCamera() {
@@ -2034,19 +2598,39 @@ function renderCanvas() {
   canvas.innerHTML = "";
   canvas.classList.toggle("weekly-slate", state.viewMode === "weekly");
   canvas.classList.toggle("monthly-calendar", state.viewMode === "monthly");
+  canvas.classList.toggle("large-overview", state.viewMode === "large");
   if (state.viewMode === "weekly") {
     renderWeeklyCanvas();
     renderCamera();
+    scheduleMemoryBudgetSweep();
     return;
   }
   if (state.viewMode === "monthly") {
     renderMonthlyCanvas();
     renderCamera();
+    scheduleMemoryBudgetSweep();
     return;
   }
-  canvas.classList.remove("weekly-slate", "monthly-calendar");
-  items().slice().sort((a, b) => a.z - b.z).forEach((item) => canvas.appendChild(createBoardObject(item)));
+  if (state.viewMode === "large") {
+    renderLargeDayOverview();
+    renderCamera();
+    scheduleMemoryBudgetSweep();
+    return;
+  }
+  canvas.classList.remove("weekly-slate", "monthly-calendar", "large-overview");
+  const viewportBounds = currentViewportWorldBounds();
+  let renderedCount = 0;
+  let virtualCount = 0;
+  items().slice().sort((a, b) => a.z - b.z).forEach((item) => {
+    const heavy = shouldRenderHeavyObject(item, viewportBounds);
+    if (heavy) renderedCount += 1; else virtualCount += 1;
+    canvas.appendChild(heavy ? createBoardObject(item) : createVirtualObject(item));
+  });
+  boardShell.dataset.renderedCount = String(renderedCount);
+  boardShell.dataset.virtualCount = String(virtualCount);
+  lastVirtualRenderKey = virtualRenderKey();
   renderCamera();
+  scheduleMemoryBudgetSweep();
 }
 
 function isMissingImportedMedia(item) { return item?.kind !== "link" && ["missing-reference", "unsupported-reference"].includes(item?.mediaResolution); }
@@ -2091,10 +2675,14 @@ function createImageObject(item) {
 
   const missingMedia = isMissingImportedMedia(item);
   const img = document.createElement("img");
-  img.src = item.src || "";
+  const renderSrc = imageRenderSource(item);
   img.alt = item.keywords[0] || "Captured image";
   img.draggable = false;
+  img.loading = "lazy";
+  img.decoding = "async";
+  img.dataset.variant = renderSrc === item.thumbnailSrc ? "thumbnail" : "working";
   img.addEventListener("load", () => { item.aspect = img.naturalHeight / img.naturalWidth; }, { once: true });
+  if (renderSrc) img.src = renderSrc;
   const missing = createMissingMediaPlaceholder(item);
 
   const lockMark = document.createElement("span");
@@ -2278,7 +2866,9 @@ function readableAiKeywordError(error) {
     AI_PROVIDER_REQUIRES_OPT_IN: "Enable Qwen first",
     AI_PROVIDER_CONSENT_REQUIRED: "AI consent required",
     AI_PROVIDER_DISABLED: "Provider disabled",
-    AI_PROVIDER_NETWORK_ERROR: "Network error"
+    AI_PROVIDER_NETWORK_ERROR: "Network error",
+    AI_SECURE_STORAGE_UNAVAILABLE: "Secure key storage unavailable",
+    AI_API_KEY_TOO_LONG: "API key file is too long"
   };
   return labels[code] || (code || "Keyword generation failed");
 }
@@ -2297,14 +2887,16 @@ function aiKeywordErrorDetail(error) {
     AI_PROVIDER_REQUIRES_OPT_IN: "Enable Qwen from More before making external AI requests.",
     AI_PROVIDER_CONSENT_REQUIRED: "Qwen needs image and network access to run.",
     AI_PROVIDER_DISABLED: "This provider is registered but cannot run in this build.",
-    AI_PROVIDER_NETWORK_ERROR: "The provider request failed before a valid keyword response was received."
+    AI_PROVIDER_NETWORK_ERROR: "The provider request failed before a valid keyword response was received.",
+    AI_SECURE_STORAGE_UNAVAILABLE: "This desktop session cannot encrypt local secrets. Use an environment variable for now.",
+    AI_API_KEY_TOO_LONG: "Choose a small text file that contains only the Qwen API key or KEY=value line."
   };
   return details[code] || "";
 }
 async function generateKeywordCandidatesForItem(item, regenerate = false) {
   await refreshKeywordProviderState();
   const providerId = profileState.keywordProvider?.activeProvider || "local-mock";
-  if (providerId !== "local-mock" && !isAiKeywordImageReady(item)) { markAiKeywordWaitingForDurable(item, false); return; }
+  if (providerId !== "local-mock" && !isAiKeywordImageReady(item)) { markAiKeywordWaitingForDurable(item, true, aiAutoKeywordEnabled); return; }
   const options = qwenProviderOptions();
   const request = keywordGatewayRequest(item, providerId);
   const requestPromptVersion = request.promptVersion || "keyword-prompt-v1";
@@ -2317,6 +2909,7 @@ async function generateKeywordCandidatesForItem(item, regenerate = false) {
   item.aiKeywordPromptVersion = requestPromptVersion;
   item.aiKeywordInFlight = true;
   item.aiKeywordRetryWhenDurable = false;
+  item.aiKeywordAutoQueued = false;
   if (regenerate) item.keywordCandidates = cloneKeywordCandidates(item.keywordCandidates).filter((candidate) => candidate.state === "accepted");
   renderCanvas();
   persistAiJob(job, true);
@@ -2346,6 +2939,7 @@ async function generateKeywordCandidatesForItem(item, regenerate = false) {
     item.aiKeywordError = error?.message || "Keyword generation failed";
     item.aiKeywordInFlight = false;
     item.aiKeywordRetryWhenDurable = false;
+    item.aiKeywordAutoQueued = false;
     job = upsertAiJob({ ...job, state: "failed", completedAtUtc: new Date().toISOString(), error: item.aiKeywordError });
     renderCanvas();
     persist({ immediate: true, mutations: [makeMutation("ai.job", { job: { ...job } }, item.id), makeMutation("keyword.candidates", { provider: providerId, promptVersion: item.aiKeywordPromptVersion || requestPromptVersion, state: "failed", error: item.aiKeywordError, candidates: cloneKeywordCandidates(item.keywordCandidates), jobId: item.aiKeywordJobId || request.requestId, generatedAtUtc: item.aiKeywordLastRunAtUtc || "" }, item.id)] });
@@ -2478,7 +3072,7 @@ function createKeywordLayer(item) {
   } else if (!suggestions.length) {
     const empty = document.createElement("span");
     empty.className = "ai-keyword-empty";
-    empty.textContent = item.aiKeywordState === "pending" ? "AI is preparing candidates" : "No unreviewed suggestions";
+    empty.textContent = item.aiKeywordError === "AI_IMAGE_NOT_DURABLE" ? "Waiting for image save" : item.aiKeywordState === "pending" ? "AI is preparing candidates" : "No unreviewed suggestions";
     aiPanel.appendChild(empty);
   }
   if (suggestions.length) {
@@ -2789,7 +3383,7 @@ function continuePointer(event) {
   if (!dragIntent) return;
   const { item, origin } = dragIntent;
   const cam = camera();
-  if (dragIntent.type === "pan") { cam.x = Math.round(origin.cameraX + event.clientX - origin.pointerX); cam.y = Math.round(origin.cameraY + event.clientY - origin.pointerY); renderCamera(); return; }
+  if (dragIntent.type === "pan") { cam.x = Math.round(origin.cameraX + event.clientX - origin.pointerX); cam.y = Math.round(origin.cameraY + event.clientY - origin.pointerY); renderCamera(); scheduleVirtualRenderRefresh(160); return; }
   if (dragIntent.type === "move") { item.x = Math.round(origin.x + (event.clientX - origin.pointerX) / cam.zoom); item.y = Math.round(origin.y + (event.clientY - origin.pointerY) / cam.zoom); }
   if (dragIntent.type === "resize") {
     const world = screenToWorld(event.clientX, event.clientY);
@@ -2843,6 +3437,7 @@ function zoomAtViewportCenter(multiplier) {
   cam.y = Math.round(centerY - before.y * nextZoom);
   cam.zoom = Number(nextZoom.toFixed(3));
   renderCamera();
+  scheduleVirtualRenderRefresh(120);
   persist({ type: "camera.update", payload: { camera: { ...camera() }, source: "keyboard" } });
 }
 
@@ -2908,10 +3503,10 @@ function handleWheelZoom(event) {
   cam.x = Math.round(event.clientX - before.x * nextZoom);
   cam.y = Math.round(event.clientY - before.y * nextZoom);
   cam.zoom = Number(nextZoom.toFixed(3));
-  renderCamera(); persist({ type: "camera.update", payload: { camera: { ...camera() }, source: "wheel" } });
+  renderCamera(); scheduleVirtualRenderRefresh(120); persist({ type: "camera.update", payload: { camera: { ...camera() }, source: "wheel" } });
 }
 function resetCamera() {
-  if (isOverviewMode()) { saveState.textContent = state.viewMode === "weekly" ? "Weekly view" : "Monthly view"; setTimeout(() => { saveState.textContent = "Saved"; }, TRASH_FEEDBACK_MS); return; }
+  if (isOverviewMode()) { saveState.textContent = state.viewMode === "weekly" ? "Weekly view" : state.viewMode === "monthly" ? "Monthly view" : "Overview view"; setTimeout(() => { saveState.textContent = "Saved"; }, TRASH_FEEDBACK_MS); return; }
   day().camera = { ...DEFAULT_CAMERA }; renderCamera(); persist({ type: "camera.reset", payload: { camera: { ...day().camera } } });
 }
 
@@ -3129,12 +3724,15 @@ async function commitLocalCapture(item, dataUrl, naturalSize, sourceType, candid
   maybeAutoGenerateKeywords(item);
 }
 
-async function captureFile(file, sourceType, worldPoint) {
+async function captureFileNow(file, sourceType, worldPoint) {
   saveState.textContent = sourceType === "browser-drag" ? "Dropping" : "Pasting";
   const src = await readFileAsDataUrl(file);
   const naturalSize = await imageSizeFromSource(src);
   const item = createCapturedImage(src, naturalSize, sourceType, worldPoint, { lifecycleState: shellBridge?.commitCapturedMedia ? "LOCALIZING" : "READY", captureJobId: `capture-${Date.now()}-${Math.random().toString(16).slice(2, 7)}` });
   await commitLocalCapture(item, src, naturalSize, sourceType, { fileName: file.name || "untitled", fileType: file.type || "", byteLength: file.size || 0 });
+}
+async function captureFile(file, sourceType, worldPoint) {
+  return enqueueCaptureTask(sourceType === "browser-drag" ? "Dropping" : "Pasting", () => captureFileNow(file, sourceType, worldPoint));
 }
 async function captureRemoteUrl(url, worldPoint) {
   saveState.textContent = "Resolving";
@@ -3170,9 +3768,16 @@ async function handleDrop(event) {
   event.preventDefault(); event.stopPropagation(); boardShell.classList.remove("drag-over"); closePopovers();
   const probe = recordDragHarness("drop", event, { target: "canvas" });
   const worldPoint = screenToWorld(event.clientX, event.clientY);
-  const file = [...event.dataTransfer.files].find((candidate) => candidate.type.startsWith("image/"));
+  const files = [...event.dataTransfer.files].filter((candidate) => candidate.type.startsWith("image/"));
   try {
-    if (file) return await captureFile(file, "browser-drag", worldPoint);
+    if (files.length) {
+      files.forEach((file, index) => {
+        const point = { x: worldPoint.x + index * 28, y: worldPoint.y + index * 28 };
+        captureFile(file, "browser-drag", point);
+      });
+      saveState.textContent = files.length > 1 ? "Queued " + files.length + " images" : "Dropping";
+      return;
+    }
     const url = firstUrlFromDrop(event.dataTransfer);
     if (!url) throw new Error("No drop candidate");
     const candidate = probe.candidate || dragCandidateFrom(event.dataTransfer);
@@ -3193,7 +3798,7 @@ function shiftDay(days) {
 }
 
 function setViewMode(mode) {
-  const nextMode = ["day", "weekly", "monthly"].includes(mode) ? mode : "day";
+  const nextMode = ["day", "weekly", "monthly", "large"].includes(mode) ? mode : "day";
   state.viewMode = nextMode;
   state.selectedId = null; state.activeKeywordId = null; state.expandedNoteId = null;
   popoverLayer.innerHTML = "";
@@ -3349,6 +3954,7 @@ function itemExportBounds(item) {
 function currentDayExportBounds() {
   const currentItems = items();
   if (!currentItems.length) return { ok: false, error: "FULL_DAY_EMPTY" };
+  if (currentItems.length > FULL_DAY_EXPORT_MAX_OBJECTS) return { ok: false, error: "Full-day PNG is too large: " + currentItems.length + " refs. Use JSON export or Large day overview for this pass.", itemCount: currentItems.length, maxObjects: FULL_DAY_EXPORT_MAX_OBJECTS };
   const bounds = currentItems.map(itemExportBounds).reduce((acc, box) => ({
     left: Math.min(acc.left, box.left),
     top: Math.min(acc.top, box.top),
@@ -3358,12 +3964,23 @@ function currentDayExportBounds() {
   const padding = 120;
   const width = Math.ceil(bounds.right - bounds.left + padding * 2);
   const height = Math.ceil(bounds.bottom - bounds.top + padding * 2);
-  if (width * height > 60 * 1000 * 1000 || width > 10000 || height > 10000) return { ok: false, error: "Full-day export is too large for this pass", width, height };
-  return { ok: true, left: bounds.left - padding, top: bounds.top - padding, width, height };
+  const pixelCount = width * height;
+  if (pixelCount > FULL_DAY_EXPORT_MAX_PIXELS || width > FULL_DAY_EXPORT_MAX_DIMENSION || height > FULL_DAY_EXPORT_MAX_DIMENSION) return { ok: false, error: "Full-day PNG is too large: " + width + " x " + height + " px. Try viewport PNG for now.", width, height, pixelCount };
+  return { ok: true, left: bounds.left - padding, top: bounds.top - padding, width, height, pixelCount, itemCount: currentItems.length };
 }
 
 function nextFrame() {
   return new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+}
+
+function formatMegapixels(value) { return Math.round(Number(value || 0) / 100000) / 10 + "MP"; }
+function fullDayExportSummary() {
+  const bounds = currentDayExportBounds();
+  if (!bounds.ok) return "Guarded";
+  return bounds.itemCount + " refs / " + formatMegapixels(bounds.pixelCount);
+}
+function exportGuardCopy() {
+  return "Full-day PNG guard: up to " + FULL_DAY_EXPORT_MAX_OBJECTS + " refs, " + FULL_DAY_EXPORT_MAX_DIMENSION + "px per side, " + formatMegapixels(FULL_DAY_EXPORT_MAX_PIXELS) + ".";
 }
 
 async function exportFullDayPng(popover) {
@@ -3418,10 +4035,12 @@ function openExportPopover(popover) {
   const title = document.createElement("h2"); title.textContent = "Download / Share";
   const json = makePopoverButton("Export day JSON", "Local metadata", () => exportCurrentDayJson(popover));
   const png = makePopoverButton("Export viewport PNG", shellBridge?.captureViewportPng ? "Desktop capture" : "Desktop only", () => exportViewportPng(popover), !shellBridge?.captureViewportPng);
-  const fullDayPng = makePopoverButton("Export full-day PNG", shellBridge?.captureFullDayPng ? "Whole day" : "Desktop only", () => exportFullDayPng(popover), !shellBridge?.captureFullDayPng);
+  const fullDayPng = makePopoverButton("Export full-day PNG", shellBridge?.captureFullDayPng ? fullDayExportSummary() : "Desktop only", () => exportFullDayPng(popover), !shellBridge?.captureFullDayPng);
+  fullDayPng.title = exportGuardCopy();
+  const guard = document.createElement("p"); guard.className = "export-guard"; guard.textContent = exportGuardCopy();
   const help = document.createElement("p"); help.className = "export-help"; help.textContent = shellBridge ? "Desktop exports open a Save As window so you can choose the folder." : "Browser preview uses your browser download location; the desktop app lets you choose a folder.";
   const status = document.createElement("div"); status.className = "export-status"; status.textContent = "Choose an export format.";
-  popover.append(title, help, json, png, fullDayPng, status);
+  popover.append(title, help, json, png, fullDayPng, guard, status);
 }
 function openActionPopover(trigger) {
   const type = trigger.dataset.popover;
@@ -3460,6 +4079,7 @@ document.querySelector("#next-day").addEventListener("click", () => shiftDay(1))
 document.querySelector("#today").addEventListener("click", () => { state.activeDayId = dateKeyFromDate(new Date()); state.selectedId = null; state.activeKeywordId = null; state.expandedNoteId = null; day(); renderChrome(); renderCanvas(); persist({ type: "day.select", payload: { activeDayId: state.activeDayId, viewMode: state.viewMode, today: true } }); });
 resetView.addEventListener("click", resetCamera);
 boardShell.addEventListener("wheel", handleWheelZoom, { passive: false });
+canvas.addEventListener("scroll", () => scheduleMemoryBudgetSweep(80));
 boardShell.addEventListener("pointerdown", beginPan);
 window.addEventListener("dragenter", handleDragOver, true);
 window.addEventListener("dragover", handleDragOver, true);
