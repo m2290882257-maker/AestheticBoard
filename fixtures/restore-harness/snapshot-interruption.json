@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "product": "AestheticBoard",
+  "fixtureType": "restore-harness-scenario",
+  "createdAtUtc": "2026-08-29T00:00:00.000Z",
+  "scenario": "snapshot-interruption",
+  "description": "Workspace snapshot has an older revision than the last ACK marker; verification should report the revision without mutating the board.",
+  "snapshot": {
+    "activeDayId": "2026-08-29",
+    "persistenceRevision": 1,
+    "days": {
+      "2026-08-29": {
+        "title": "Interrupted Snapshot",
+        "camera": {
+          "x": 0,
+          "y": 0,
+          "zoom": 1
+        },
+        "pasteSequence": 0,
+        "items": [],
+        "trash": []
+      }
+    }
+  }
+}

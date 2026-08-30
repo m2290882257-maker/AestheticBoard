@@ -1539,3 +1539,23 @@ Pro Gateway 未来提供 Add Selected Images、Add Current Day、Open Journal Ca
 ---
 
 # End of InteractionFlow.md v2.1
+
+---
+
+# Implementation Sync - 2026-08-29
+
+The live prototype has completed Slices 01-45 plus post-slice navigation polish. Current implemented behavior includes the board shell, temporal canvas, drag/paste image capture, link capture, trash retention, Electron desktop shell, Local Profile v1, SQLite metadata scaffold, local original media commit, app-media asset loading, Persistence Worker revision ACK, restart recovery, per-image capture lifecycle UI, typed mutation validation, capture job recovery, media derivatives, object-level retry/repair, search, local export/import, restore diagnostics, remote image URL localization, durable SQLite search indexing, import-as-new-day, durable mutation retry metadata, full-day PNG export, hardened remote URL fetch policy, initial Electron domain module extraction, backup/restore UX, local automated recovery/export checks, local-first AI keyword candidate review, media-aware backup import preview, explicit AI provider safety settings, hardened keyword candidate persistence, compact import preview details, provider opt-in boundaries, keyword conflict detail, batch imported media relink, disabled external-provider consent surfaces, and working Day / Weekly / Monthly overview navigation.
+
+Current implementation notes:
+
+- Desktop `Saved` must mean a persistence ACK has returned from the main-process Persistence Worker.
+- Renderer remains responsible for immediate visual feedback only.
+- Move and resize are coalesced by interaction design: geometry updates visually during pointer movement and only the final state is persisted on pointerup.
+- Restart recovery currently uses `workspace-snapshot.json` as the primary Profile snapshot, with SQLite storing a `canvas_state` copy.
+- Capture failures must stay local to the affected image object and must not block the rest of the canvas.
+- Local and supported remote images should resolve through the media index and `app-media://asset/<assetId>?variant=working`, with fallback to original when derivatives are missing.
+- Search currently highlights and camera-jumps to objects without reflowing the board; desktop search is backed by the SQLite search index, with renderer search as preview fallback.
+- Export is local-only and non-mutating; desktop JSON and viewport PNG exports ask the user for a save location.
+- Retry and repair surfaces should remain compact and object-local wherever possible; retry queue metadata now survives restart.
+
+See `PROJECT_STATUS.md` for the current implementation matrix, plain-language slice notes, known technical debt, and next slices.

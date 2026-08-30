@@ -6,7 +6,9 @@
   "main": "electron/main.cjs",
   "scripts": {
     "start": "electron .",
-    "check": "node --check app.js && node --check server.js && node --check electron/main.cjs && node --check electron/preload.cjs && node --check electron/persistence.cjs && node --check electron/media-store.cjs"
+    "check": "node --check app.js && node --check server.js && node --check electron/main.cjs && node --check electron/preload.cjs && node --check electron/persistence.cjs && node --check electron/media-store.cjs && node --check electron/mutation-contract.cjs && node --check electron/remote-policy.cjs && node --check electron/export-helpers.cjs && node --check electron/keyword-gateway.cjs && node --check electron/ai-provider-connectors.cjs && node --check electron/import-media-resolution.cjs && npm run check:electron-recovery",
+    "check:electron-recovery": "node scripts/electron-recovery-export-check.cjs",
+    "check:provider:qwen": "node scripts/qwen-provider-smoke-check.cjs"
   },
   "devDependencies": {
     "electron": "^32.3.3"

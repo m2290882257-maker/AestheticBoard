@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "product": "AestheticBoard",
+  "fixtureType": "restore-harness-scenario",
+  "createdAtUtc": "2026-08-29T00:00:00.000Z",
+  "scenario": "failed-capture-job",
+  "description": "A failed capture remains inspectable and should not block new captures.",
+  "captureJobs": [
+    {
+      "id": "capture-fixture-failed",
+      "state": "FAILED",
+      "dayCanvasId": "2026-08-29",
+      "sourceType": "fixture",
+      "lastErrorCode": "FIXTURE_CAPTURE_FAILED"
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "product": "AestheticBoard",
+  "fixtureType": "restore-harness-scenario",
+  "createdAtUtc": "2026-08-29T00:00:00.000Z",
+  "scenario": "durable-media",
+  "description": "Represents a durable media asset that should restore through assetId and app-media variants without absolute local paths.",
+  "mediaAssets": [
+    {
+      "assetId": "asset-fixture-durable",
+      "sha256": "fixture-sha256",
+      "originalRelpath": "media/originals/fixture.png",
+      "variants": {
+        "original": {
+          "state": "ready",
+          "relpath": "media/originals/fixture.png"
+        },
+        "working": {
+          "state": "ready",
+          "relpath": "media/working/fixture-working.png"
+        },
+        "thumbnail": {
+          "state": "ready",
+          "relpath": "media/thumbnails/fixture-thumbnail.png"
+        }
+      }
+    }
+  ]
+}

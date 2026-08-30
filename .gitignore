@@ -2,3 +2,5 @@
 .npm-cache/
 .electron-cache/
 .localappdata/
+tmp-*.cjs
+不上传_开发文档/
