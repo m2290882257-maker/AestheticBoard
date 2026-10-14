@@ -1,29 +1,66 @@
-问题原因很明确：你在 `C:\Windows\system32` 里运行了 `npm start`，但项目的 `package.json` 在：
+﻿# 启动 PowerShell 帮助
 
-`E:\Codex_Projects\AestheticBoard`
+## 1. 正常启动桌面端
 
-所以请在 PowerShell 里先切到项目目录，再启动：
+日常免终端启动：首次双击项目中的 install-shortcuts.cmd 创建桌面和开始菜单的 AestheticBoard 快捷方式，之后直接点击即可。完整说明见 [README.md](README.md)。
 
-```powershell
-cd /d E:\Codex_Projects\AestheticBoard
-cmd /c npm start
-```
+如果你看到 `Could not read package.json`，通常是因为 PowerShell 当前目录在 `C:\Windows\System32`，而不是项目目录。
 
-如果 PowerShell 不认 `cd /d`，就用：
+请先切到项目目录，再启动：
 
 ```powershell
 Set-Location E:\Codex_Projects\AestheticBoard
 cmd /c npm start
 ```
 
-我刚确认过项目里的 `package.json` 和 Electron 入口都在，启动脚本也是正常的：`npm start` 会执行 `electron .`。所以这不是项目坏了，只是启动命令运行的位置错了。
+也可以用预览服务：
 
+```powershell
+Set-Location E:\Codex_Projects\AestheticBoard
+node server.js
+```
 
+## 2. 启动带 Qwen AI 的桌面端
 
+快捷方式不会继承其他 PowerShell 会话的临时环境变量。建议在应用的 AI Privacy 中导入并加密保存 Qwen key。使用下方临时变量前，先关闭已有应用窗口。
 
-- Dense / Zoomed-out 退让策略：图片数量达到密集阈值时，未选中的 Keyword 和 Quick Note 会弱化；缩小到较低 zoom 时，未选中的文字层会隐藏，保留图片关系、选中态和 locked 状态。
-- 键盘操作：选中图片后可用方向键移动，`Shift + 方向键` 大步移动，`Delete / Backspace` 移入 Trash，`+ / - / 0` 分别放大、缩小、重置视图，`Esc` 关闭浮层和展开状态。
-- 响应式与可访问性：小窗口下控件会移到底部避免遮挡标题；图标按钮补了 title，画布和图片对象补了焦点路径，状态文本改为安静的可读反馈；也加了 forced-colors 高对比模式的基础样式。
+API key 不要写进代码、Markdown、截图或 Git。只在当前 PowerShell 会话里临时设置：
 
-已检查：`npm run check` 通过。  
-你刷新右侧页面，或重启桌面端 Electron 窗口后就能试。
+```powershell
+Set-Location E:\Codex_Projects\AestheticBoard
+$env:AESTHETICBOARD_QWEN_MODEL = "qwen3.7-flash"
+$env:AESTHETICBOARD_AI_PROVIDER = "qwen3.7-flash"
+$env:AESTHETICBOARD_EXTERNAL_AI_ENABLED = "1"
+$env:AESTHETICBOARD_QWEN_API_KEY = "你的 Qwen 或 DashScope API Key"
+cmd /c npm start
+```
+
+也可以用 `DASHSCOPE_API_KEY` 作为备用变量名。
+
+## 3. 检查 Qwen 连接
+
+同一个 PowerShell 会话里运行：
+
+```powershell
+Set-Location E:\Codex_Projects\AestheticBoard
+cmd /c npm run check:provider:qwen
+```
+
+如果返回 `AI_MISSING_API_KEY`，说明这个 PowerShell 会话没有读到 `AESTHETICBOARD_QWEN_API_KEY` 或 `DASHSCOPE_API_KEY`。
+
+## 4. 当前文档位置
+
+核心开发文档已经统一放到 `docs/` 目录，避免根目录堆太多重复 Markdown：
+
+- `PROJECT_STATUS.md` 仍保留在根目录，作为当前进度总账。
+- 产品和设计规范在 `docs/PRD.md v2.1 — Capture-first Temporal Spatial Inspiration Board.md`、`docs/DevelopmentSpecs.md`、`docs/Architecture (1).md` 等文件中。
+- Qwen prompt 在 `docs/QWEN_KEYWORD_PROMPT.md`。
+
+## 5. 常用检查
+
+```powershell
+Set-Location E:\Codex_Projects\AestheticBoard
+cmd /c npm run check
+```
+
+这个检查会覆盖前端脚本、Electron 主进程、持久化、媒体、导入导出、搜索、AI provider 基础路径和恢复检查。
