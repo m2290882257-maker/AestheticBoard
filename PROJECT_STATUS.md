@@ -1,8 +1,8 @@
-﻿# AestheticBoard Project Status
+# AestheticBoard Project Status
 
-> Last updated: 2026-08-30
+> Last updated: 2026-10-14
 > Current local branch: pr/slices-15-17
-> Latest PR: https://github.com/m2290882257-maker/AestheticBoard/pull/2
+> Latest PR: https://github.com/m2290882257-maker/AestheticBoard/pull/3
 
 ## Current Implementation State
 
@@ -803,3 +803,31 @@ Git/PR note:
 - Product code, Electron helpers, automated checks, and Project Status are ready for commit.
 - GitHub CLI is installed at C:\Program Files\GitHub CLI\gh.exe, but the active GitHub token is invalid in this shell. Re-authentication is required before gh pr create can succeed.
 
+
+## Current Progress Sync - 2026-10-14 Compact Desktop Capture And Project Layout
+
+Desktop windows now resize down to 360 x 320 device-independent pixels instead of the previous 960 x 640 minimum. The user confirmed the smaller window works before the compact chrome layout was implemented.
+
+Current changes:
+
+- Below 760px content width, title/date remain above a compact date/view row; actions and Reset View sit on opposite sides of the bottom edge, with save status above them.
+- Wide windows below 500px content height use compact header controls. Board Shell no longer keeps a hidden 640px minimum height.
+- Popovers remain inside the viewport and scroll vertically; resizing with a menu open recomputes its bounds.
+- Day, Weekly, Monthly, search, image capture, dragging, and Quick Note entry points remain available. Window resize preserves object coordinates, image widths, notes, and camera.
+- Desktop launch setup uses install-shortcuts.cmd and scripts/install-shortcuts.ps1. The single-instance lock focuses/restores the existing application window on repeated launches.
+- Planning/design documents and the existing design image are preserved under docs/; README.md explains installation, desktop launch, compact capture, local data, and checks.
+
+Validation completed on 2026-10-14:
+
+- npm run check passed, including existing recovery/export/provider regression checks; git diff --check passed for the layout change.
+- Isolated native Electron windows accepted small, narrow/tall, short/wide, and normal dimensions. Saved 420 x 360 bounds recreated as 422 x 362; the check records a 2 DIP recreation tolerance rather than claiming exact equality.
+- Headless browser verification passed 14 content viewport sizes, from 344 x 270 through 1440 x 900, and 75 menu bounds checks.
+- Interaction checks covered long title editing, date navigation, Day/Weekly/Monthly switching, menu scrolling without camera zoom, open-menu resize, search, generated-PNG paste/drop events, image dragging, and Quick Note persistence across reload.
+- Desktop Data & Privacy was verified as a browser layout fixture; browser tests do not prove OS clipboard/browser drag payload compatibility or every Windows DPI combination.
+- Normal-window chrome matches its baseline. The original styles, existing project changes, and actual user Profile/media data were preserved.
+
+Publication scope:
+
+- The user explicitly requested syncing all current project changes, including the existing docs migration, launch setup, and single-instance support.
+- This update continues PR #3, whose earlier AI secure-key-storage and queue QA work remains part of the proposed changes against main.
+- Local backup/recovery files, test profiles/screenshots, node_modules, caches, generated shortcuts, and live Profile data remain excluded from Git.

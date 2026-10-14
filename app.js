@@ -3807,6 +3807,17 @@ function setViewMode(mode) {
   persist({ type: "day.select", payload: { activeDayId: state.activeDayId, viewMode: state.viewMode } });
 }
 
+function fitPopoverToViewport(popover, anchorX, anchorY) {
+  if (anchorX !== undefined) popover.dataset.anchorX = String(anchorX);
+  if (anchorY !== undefined) popover.dataset.anchorY = String(anchorY);
+  const inset = 14;
+  const top = clamp(Number(popover.dataset.anchorY || inset), inset, Math.max(inset, window.innerHeight - 180));
+  popover.style.top = `${top}px`;
+  popover.style.setProperty("--popover-top", `${top}px`);
+  const width = popover.getBoundingClientRect().width;
+  popover.style.left = `${clamp(Number(popover.dataset.anchorX || inset), inset, Math.max(inset, window.innerWidth - width - inset))}px`;
+}
+
 function openModePopover(event) {
   event.stopPropagation();
   const rect = modeSelector.getBoundingClientRect();
@@ -3823,6 +3834,7 @@ function openModePopover(event) {
   const monthlyButton = makePopoverButton("Monthly", state.viewMode === "monthly" ? "Current" : "Open", () => setViewMode("monthly"));
   popover.append(title, dayButton, weeklyButton, monthlyButton);
   popoverLayer.appendChild(popover);
+  fitPopoverToViewport(popover, rect.left, rect.bottom + 8);
 }
 
 function openContextMenu(event, item) {
@@ -3838,6 +3850,7 @@ function openContextMenu(event, item) {
   menu.querySelector('[data-action="open"]')?.addEventListener("click", () => { window.open(item.url, "_blank", "noopener"); closePopovers(); });
   menu.querySelector('[data-action="trash"]').addEventListener("click", () => { closePopovers(); moveImageToTrash(item.id); });
   popoverLayer.appendChild(menu);
+  fitPopoverToViewport(menu, event.clientX, event.clientY);
 }
 
 function formatTrashTime(value) {
@@ -4068,6 +4081,7 @@ function openActionPopover(trigger) {
   if (type === "export") openExportPopover(popover);
   if (type === "trash") openTrashPopover(popover);
   popoverLayer.appendChild(popover);
+  fitPopoverToViewport(popover, rect.right + 10, rect.top);
 }
 function closePopovers() { searchState.open = false; searchState.query = ""; searchState.results = []; popoverLayer.innerHTML = ""; renderCanvas(); }
 
@@ -4103,6 +4117,9 @@ canvas.addEventListener("pointerdown", (event) => {
 });
 document.addEventListener("keydown", handleGlobalKeydown);
 document.addEventListener("click", (event) => { if (!event.target.closest(".popover,.action-bar,.view-mode-selector,.view-controls")) closePopovers(); });
+window.addEventListener("resize", () => {
+  popoverLayer.querySelectorAll(".popover").forEach((popover) => fitPopoverToViewport(popover));
+});
 window.addEventListener("blur", () => disableAiAutoKeywords("window-left"));
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") disableAiAutoKeywords("window-left"); });
 

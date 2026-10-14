@@ -16,6 +16,8 @@ const stateFileName = 'workspace-state.json';
 const productProfileId = 'AestheticBoard';
 const localDataDirectory = path.join(process.env.LOCALAPPDATA || app.getPath('appData'), productProfileId);
 app.setPath('userData', localDataDirectory);
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
+if (!hasSingleInstanceLock) app.quit();
 app.disableHardwareAcceleration();
 app.commandLine.appendSwitch('disable-gpu');
 app.commandLine.appendSwitch('disable-gpu-compositing');
@@ -821,8 +823,8 @@ function createWindow() {
   const bounds = visibleBounds(workspaceState.bounds);
   mainWindow = new BrowserWindow({
     ...bounds,
-    minWidth: 960,
-    minHeight: 640,
+    minWidth: 360,
+    minHeight: 320,
     title: 'Aesthetic Board',
     backgroundColor: '#f4f1e9',
     autoHideMenuBar: true,
@@ -851,13 +853,24 @@ function createWindow() {
   mainWindow.on('close', rememberBounds);
 }
 
-app.whenReady().then(() => {
-  registerMediaProtocol();
-  createWindow();
-});
-app.on('activate', () => {
-  if (BrowserWindow.getAllWindows().length === 0) createWindow();
-});
+if (hasSingleInstanceLock) {
+  app.on('second-instance', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.show();
+      mainWindow.focus();
+    } else if (app.isReady()) {
+      createWindow();
+    }
+  });
+  app.whenReady().then(() => {
+    registerMediaProtocol();
+    createWindow();
+  });
+  app.on('activate', () => {
+    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  });
+}
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });

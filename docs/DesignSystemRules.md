@@ -485,15 +485,23 @@ More → Journal → Theme → Download / Share → Trash
 - Day 为 P0；Week / Month 未实现时必须表现为不可用或开发占位，不得切换到空白伪页面；
 - 与 Global Action Bar 使用同一 System Voice 与 surface family。
 
-### 11.4 Responsive Chrome `PROVISIONAL`
+### 11.4 Responsive Chrome — 2026-10-14 实现同步
 
-| Window width | Layout |
+| Content viewport | Layout |
 | --- | --- |
 | `>= 1200px` | Title 左上，Action Bar 位于其下；Temporal Controls 右上 |
-| `960–1199px` | 收紧 page safe area 与 Title max-width；保持两侧分离 |
-| `< 960px` | 允许 Temporal Controls 合并为单一 compact group；禁止覆盖 Title |
+| `960–1199px` | 保持标题和右侧时间控件分离 |
+| `760–959px` | 收紧安全区；保留日期、视图和缩放入口 |
+| `< 760px` | 标题单行省略；日期与 Day / Weekly / Monthly 位于标题下方；Action Bar 和 Reset View 分列底部；保存状态位于底栏上方 |
+| `width >= 760px` 且 `height < 500px` | 紧凑标题和工具栏；右侧缩放入口移到时间控件下方 |
 
-首轮建议最小窗口 `960 × 640px`，状态为 `PROVISIONAL`，需真实 Windows resize 验证。
+原生窗口下限为 `360 × 320` Windows 设备独立像素，包含标题栏和边框。此下限已由用户确认；内容 viewport 会略小，不能将原生窗口尺寸直接当作 CSS viewport 尺寸。原先的 `960 × 640px` 暂定下限已被替代。
+
+- Board Shell 随实际 viewport 缩小，不再保留 640px 的内部最小高度。
+- 弹窗宽、高受 viewport 限制，长菜单纵向滚动；打开菜单后缩放窗口仍保持入口可达。
+- 小窗保留全部现有功能入口；周、月和大日视图使用可滚动内容区域。
+- 窗口 resize 不重排 Canvas Objects、不改变 World Geometry、不重置 Camera。
+- 原生窗口尺寸保存与重建测试允许 1–2 个设备独立像素的测量差异；未声称逐像素恢复或完成所有 Windows DPI 组合验证。
 
 ---
 
@@ -707,7 +715,7 @@ locked / processing / saved / error / disabled
 - 中文：中文 Title + 三行中文 Note；
 - English：English Title + three-line English Note；
 - Mixed：中英标题、数字、标点和长关键词；
-- Window：960×640、1280×800、1440×900；
+- Window：360×320、420×700、1000×320、960×640、1280×800、1440×900；另测实际内容 viewport 344×270；
 - Windows display scale：100%、125%、150%。
 
 ### 19.3 升级为 LOCKED 的条件
